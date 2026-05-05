@@ -30,7 +30,7 @@
 substitutions:
   _REGION:       asia-south1
   _SERVICE_NAME: swati-avatar
-  _PROJECT_ID:   gen-lang-client-0966906205
+  _PROJECT_ID:   meditate-with-swati-desai
   _REPO:         cloud-run-source-deploy
   _GCS_BUCKET:   swati-rag-index
   _IMAGE:        asia-south1-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_SERVICE_NAME}
