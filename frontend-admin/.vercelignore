@@ -1,0 +1,10 @@
+# Everything outside this folder is handled by the root deploy
+../.git
+../.env
+../scraper_cache
+../rag_index
+../cache
+../videos
+../outputs
+node_modules
+.env

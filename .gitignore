@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# RAG index (stored in GCS, not git)
+rag_index/
+
+# Scraper cache & outputs (large, machine-generated)
+scraper_cache/
+cache/
+videos/
+outputs/
+links.txt
+
+# Misc
+*.log
+.DS_Store

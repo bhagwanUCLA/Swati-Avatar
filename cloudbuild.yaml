@@ -1,0 +1,79 @@
+# cloudbuild.yaml
+# ----------------
+# CI/CD pipeline for the Swati RAG service on Cloud Run.
+#
+# Trigger: push to main branch (configure in Cloud Build console).
+#
+# What it does:
+#   1. Build the Docker image from the root Dockerfile
+#   2. Push to Artifact Registry
+#   3. Deploy to Cloud Run (--update-env-vars preserves manually-set env vars)
+#
+# Env vars managed here (infra only):
+#   GOOGLE_CLOUD_PROJECT, GCS_BUCKET, FIRESTORE_DB
+#
+# Env vars set manually in Cloud Run console (survive redeploys):
+#   GEMINI_API_KEY, ANTHROPIC_API_KEY, YOUTUBE_API_KEY
+#
+# Admin password is set via the /admin/setup UI after first deploy.
+# It is hashed with Argon2 and stored in Firestore — never in env vars.
+#
+# Required IAM on the Cloud Build service account:
+#   roles/run.admin
+#   roles/iam.serviceAccountUser
+#   roles/artifactregistry.writer
+#
+# Required IAM on the Cloud Run service account:
+#   roles/datastore.user   (Firestore)
+#   roles/storage.objectAdmin on the GCS bucket
+
+substitutions:
+  _REGION:       asia-south1
+  _SERVICE_NAME: swati-avatar
+  _PROJECT_ID:   gen-lang-client-0966906205
+  _REPO:         cloud-run-source-deploy
+  _GCS_BUCKET:   swati-rag-index
+  _IMAGE:        asia-south1-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_SERVICE_NAME}
+  _FIRESTORE_DB: swati-chats
+steps:
+  # ── 1. Build Docker image ─────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_IMAGE}:$COMMIT_SHA
+      - -t
+      - ${_IMAGE}:latest
+      - .
+
+  # ── 2. Push to Artifact Registry ──────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_IMAGE}
+
+  # ── 3. Deploy to Cloud Run ────────────────────────────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --platform=managed
+      - --region=${_REGION}
+      - --image=${_IMAGE}:$COMMIT_SHA
+      - --allow-unauthenticated
+      - --memory=2Gi
+      - --cpu=2
+      - --timeout=300
+      - --update-env-vars=GOOGLE_CLOUD_PROJECT=${_PROJECT_ID},GCS_BUCKET=${_GCS_BUCKET},FIRESTORE_DB=${_FIRESTORE_DB}
+      - --quiet
+
+images:
+  - ${_IMAGE}:$COMMIT_SHA
+  - ${_IMAGE}:latest
+
+options:
+  substitutionOption: ALLOW_LOOSE
+  logging: CLOUD_LOGGING_ONLY

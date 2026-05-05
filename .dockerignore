@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+__pycache__
+scraper_cache
+rag_index
+frontend
+frontend-admin
+ingest_ui.html
+*.md
