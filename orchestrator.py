@@ -57,7 +57,24 @@ _BINARY_EXTENSIONS = {
     ".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods",
 }
 
-_ALL_SUPPORTED = _TEXT_EXTENSIONS | _BINARY_EXTENSIONS
+_VIDEO_EXTENSIONS = {
+    ".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp",
+}
+
+_VIDEO_MIME = {
+    ".mp4":  "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg":  "video/mpg",
+    ".mov":  "video/quicktime",
+    ".avi":  "video/avi",
+    ".flv":  "video/x-flv",
+    ".webm": "video/webm",
+    ".wmv":  "video/wmv",
+    ".3gp":  "video/3gpp",
+    ".3gpp": "video/3gpp",
+}
+
+_ALL_SUPPORTED = _TEXT_EXTENSIONS | _BINARY_EXTENSIONS | _VIDEO_EXTENSIONS
 
 
 class RAGOrchestrator:
@@ -232,8 +249,9 @@ class RAGOrchestrator:
         Text  : .txt  .md  .markdown  .rst  .html  .htm
         Binary: .pdf  .docx  .doc  .odt  .pptx  .ppt
                 .xlsx  .xls  .xlsm  .xlsb  .csv  .ods
+        Video : .mp4  .mpeg  .mpg  .mov  .avi  .flv  .webm  .wmv  .3gp  .3gpp
 
-        Binary files are extracted via Gemini (title + content).
+        Binary and video files are extracted via Gemini (title + content).
         Text files are read directly (title = filename stem).
 
         Parameters
@@ -297,8 +315,8 @@ class RAGOrchestrator:
                 logger.warning("Failed to read %s: %s", file_path, exc)
                 return None
 
-        # ── Binary files — Gemini extraction + local fallback ────────
-        if suffix in _BINARY_EXTENSIONS:
+        # ── Binary / video files — Gemini extraction + local PDF fallback ──
+        if suffix in _BINARY_EXTENSIONS or suffix in _VIDEO_EXTENSIONS:
             try:
                 import mimetypes as _mt
                 file_bytes = file_path.read_bytes()
@@ -317,7 +335,7 @@ class RAGOrchestrator:
                             return self._make_aux_doc(cached_title, section, url, cached_text, "text")
 
                 # Derive an accurate MIME type so Gemini picks the right prompt
-                mime_hint = _mt.guess_type(file_path.name)[0] or ""
+                mime_hint = _VIDEO_MIME.get(suffix) or _mt.guess_type(file_path.name)[0] or ""
                 if suffix == ".pdf":
                     mime_hint = "application/pdf"
 

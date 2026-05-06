@@ -990,6 +990,15 @@ def extract_file_with_gemini(
                 "TITLE: <the presentation's title>\n\n"
                 "<slide-by-slide content: slide number, title and bullet points>"
             )
+        elif (mime_hint and "video" in mime_hint) or ext.endswith(
+            (".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp")
+        ):
+            prompt = (
+                "You are extracting content from a video file.\n\n"
+                "Output format (follow exactly):\n"
+                "TITLE: <the video's title or main topic>\n\n"
+                "<full transcript or detailed summary — include all spoken content, key points, and topics discussed>"
+            )
         else:
             prompt = (
                 "You are extracting content from a document.\n\n"
