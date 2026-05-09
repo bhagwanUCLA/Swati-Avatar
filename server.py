@@ -5,12 +5,11 @@ FastAPI backend for the Portfolio RAG pipeline.
 
 Auth
 ----
-Admin routes require:  Authorization: Bearer <ADMIN_TOKEN>
-Public routes (chat, health, stats, query) have no auth.
-
-ADMIN_TOKEN is set via environment variable.  Use secrets.compare_digest
-to prevent timing attacks.  If ADMIN_TOKEN is not set the server starts
-but all admin endpoints return 503 until it is configured.
+Admin routes require a JWT Bearer token obtained from POST /login.
+Password is verified once (Argon2 against Firestore hash); a signed JWT
+(30-min expiry) is returned. Subsequent requests verify the cheap JWT
+signature instead. JWT secret = sha256(admin_hash) — stable across gunicorn
+workers and automatically invalidated if the password changes.
 
 Streaming architecture
 ----------------------
@@ -44,8 +43,10 @@ import json
 import logging
 import os
 import queue as _sync_queue
-import secrets
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+
+import jwt
 from typing import Annotated, AsyncGenerator, Optional
 from pathlib import Path
 
@@ -152,16 +153,14 @@ def require_admin(
 ) -> None:
     """
     FastAPI dependency that enforces Bearer token auth on admin routes.
-    It verifies the incoming token against the Argon2 hash stored in Firestore.
+    Verifies the JWT obtained from POST /login.
     """
-    global _cached_admin_hash
-    
-    # --- Local Bypass ---
+    global _cached_admin_hash, _jwt_secret
+
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     if not project:
-        # We are running locally. Bypass auth so the local UI works easily.
         return
-        
+
     if not _cached_admin_hash:
         try:
             _cached_admin_hash = _get_admin_hash_from_db()
@@ -178,10 +177,21 @@ def require_admin(
             detail="Admin password is not configured. Please complete setup.",
         )
 
-    if creds is None or not password_hasher.verify(creds.credentials, _cached_admin_hash):
+    if not _jwt_secret:
+        _jwt_secret = hashlib.sha256(_cached_admin_hash.encode()).hexdigest()
+
+    if creds is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing admin token.",
+            detail="Missing credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        jwt.decode(creds.credentials, _jwt_secret, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -225,6 +235,7 @@ _session_store = _build_session_store()
 
 password_hasher = PasswordHash.recommended()
 _cached_admin_hash: Optional[str] = None
+_jwt_secret: Optional[str] = None
 
 def _firestore_client():
     """Return a Firestore client using GOOGLE_CLOUD_PROJECT and FIRESTORE_DB env vars."""
@@ -415,6 +426,10 @@ class ConfigUpdate(BaseModel):
 
 
 class SetupRequest(BaseModel):
+    password: str
+
+
+class LoginRequest(BaseModel):
     password: str
 
 
@@ -799,6 +814,36 @@ def setup_password(body: SetupRequest):
                             detail="Failed to save password. Check Firestore permissions.")
     _cached_admin_hash = hashed
     return {"success": True}
+
+
+@app.post("/login")
+def login(body: LoginRequest):
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    if not project:
+        return {"access_token": "local", "token_type": "bearer"}
+
+    global _cached_admin_hash
+    if not _cached_admin_hash:
+        try:
+            _cached_admin_hash = _get_admin_hash_from_db()
+        except Exception as exc:
+            logger.error("login: Firestore read failed: %s", exc)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Cannot reach database.")
+
+    if not _cached_admin_hash:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Admin password not configured.")
+
+    try:
+        valid = password_hasher.verify(body.password, _cached_admin_hash)
+    except Exception:
+        valid = False
+    if not valid:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid password.",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    secret = hashlib.sha256(_cached_admin_hash.encode()).hexdigest()
+    payload = {"sub": "admin", "exp": datetime.now(timezone.utc) + timedelta(minutes=30)}
+    return {"access_token": jwt.encode(payload, secret, algorithm="HS256"), "token_type": "bearer"}
 
 
 @app.get("/admin/firestore/test")

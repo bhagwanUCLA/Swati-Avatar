@@ -24,3 +24,4 @@ playwright>=1.44.0
 aiohttp>=3.9.0
 nest_asyncio>=1.6.0
 youtube-transcript-api>=0.6.0
+PyJWT

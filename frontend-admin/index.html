@@ -669,24 +669,22 @@ async function doLogin() {
   const token = document.getElementById('login-token').value.trim();
   const errEl = document.getElementById('login-error');
   if (!token) { errEl.textContent = 'Password is required.'; return; }
-  
-  errEl.textContent = 'Verifying...';
-  sessionStorage.setItem('admin_token', token);
 
+  errEl.textContent = 'Verifying...';
   try {
-    const res = await authFetch(API + '/config');
-    if (res.status === 401 || res.status === 403) {
-      sessionStorage.removeItem('admin_token');
-      errEl.textContent = 'Invalid password. Please try again.';
-      return;
-    }
+    const res = await fetch(API + '/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: token })
+    });
+    if (res.status === 401) { errEl.textContent = 'Invalid password. Please try again.'; return; }
     if (!res.ok) throw new Error('Server error');
-    
+    const data = await res.json();
+    sessionStorage.setItem('admin_token', data.access_token);
     errEl.textContent = '';
     document.getElementById('login-overlay').style.display = 'none';
     loadIndex();
   } catch(e) {
-    sessionStorage.removeItem('admin_token');
     errEl.textContent = 'Could not connect to server.';
   }
 }
@@ -715,14 +713,14 @@ async function doSetup() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Setup failed');
 
-    // Verify the token actually works against a protected endpoint
-    sessionStorage.setItem('admin_token', token);
-    const verify = await authFetch(API + '/config');
-    if (!verify.ok) {
-      sessionStorage.removeItem('admin_token');
-      throw new Error('Password saved but login check failed. Please try logging in.');
-    }
-
+    const loginRes = await fetch(API + '/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: token })
+    });
+    if (!loginRes.ok) throw new Error('Password saved but login failed. Please try logging in.');
+    const loginData = await loginRes.json();
+    sessionStorage.setItem('admin_token', loginData.access_token);
     document.getElementById('login-overlay').style.display = 'none';
     loadIndex();
   } catch (err) {
