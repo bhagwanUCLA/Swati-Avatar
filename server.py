@@ -38,17 +38,20 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import logging
 import os
 import queue as _sync_queue
 import secrets
+import xml.etree.ElementTree as ET
 from typing import Annotated, AsyncGenerator, Optional
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, status
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, PlainTextResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
@@ -1097,3 +1100,79 @@ def cleanup_apply(body: CleanupRequest, _: AdminDep):
 def clear_index(_: AdminDep):
     _get_rag().db.clear()
     return {"cleared": "faiss_index"}
+
+
+# ---------------------------------------------------------------------------
+# YouTube PubSubHubbub  (automatic new-video ingestion)
+# ---------------------------------------------------------------------------
+
+@app.get("/youtube/notify")
+async def youtube_verify(hub_challenge: str = Query(..., alias="hub.challenge")):
+    """YouTube calls this once on subscription to verify the endpoint is real."""
+    return PlainTextResponse(hub_challenge)
+
+
+@app.post("/youtube/notify")
+async def youtube_notify(request: Request):
+    """
+    YouTube POSTs an Atom XML payload here within seconds of a new upload.
+    Parses the video ID and runs the existing ingest_videos pipeline.
+    """
+    body = await request.body()
+
+    secret = os.environ.get("PUBSUB_SECRET", "")
+    if secret:
+        sig = request.headers.get("X-Hub-Signature", "")
+        expected = "sha1=" + hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
+    root = ET.fromstring(body)
+    ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
+    for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
+        vid_el = entry.find("yt:videoId", ns)
+        if vid_el is not None and vid_el.text:
+            url = f"https://www.youtube.com/watch?v={vid_el.text.strip()}"
+            logger.info("PubSubHubbub: new video detected %s", url)
+            rag = _get_rag()
+            rag.ingest_videos([url])
+            _save_and_sync(rag)
+
+    return Response(status_code=204)
+
+
+@app.post("/youtube/resubscribe")
+def youtube_resubscribe(request: Request, _: AdminDep):
+    """
+    Re-registers all watched channels with PubSubHubbub.
+    Hit once manually to bootstrap, then Cloud Scheduler calls it every 15 days.
+    """
+    import requests as _req
+
+    channel_ids = [
+        c.strip()
+        for c in os.environ.get("WATCHED_CHANNEL_IDS", "").split(",")
+        if c.strip()
+    ]
+    if not channel_ids:
+        return {"resubscribed": [], "warning": "WATCHED_CHANNEL_IDS not set"}
+
+    callback = str(request.base_url).rstrip("/") + "/youtube/notify"
+    secret   = os.environ.get("PUBSUB_SECRET", "")
+
+    results = []
+    for cid in channel_ids:
+        topic = f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"
+        data  = {
+            "hub.mode":          "subscribe",
+            "hub.topic":         topic,
+            "hub.callback":      callback,
+            "hub.lease_seconds": 2592000,   # 30 days (YouTube's max)
+        }
+        if secret:
+            data["hub.secret"] = secret
+        resp = _req.post("https://pubsubhubbub.appspot.com/subscribe", data=data, timeout=15)
+        results.append({"channel_id": cid, "http_status": resp.status_code})
+        logger.info("PubSubHubbub subscribe: channel=%s status=%d", cid, resp.status_code)
+
+    return {"resubscribed": results}

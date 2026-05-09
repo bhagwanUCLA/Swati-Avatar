@@ -487,6 +487,18 @@
       </div>
       <div id="video-toast" class="toast"></div>
     </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">YouTube Auto-Ingestion (PubSubHubbub)</div>
+      <p style="font-size:13px;margin-bottom:14px;background:var(--blue-bg);color:var(--blue);padding:10px;border-radius:6px;">
+        Re-registers watched channels with YouTube's push notification hub. Run once after deploy to bootstrap,
+        then Cloud Scheduler handles renewal every 15 days. Requires <code>WATCHED_CHANNEL_IDS</code> env var set in Cloud Run.
+      </p>
+      <button class="btn btn-primary" onclick="resubscribeYoutube()">
+        <span id="resub-spinner"></span> Resubscribe YouTube channels
+      </button>
+      <div id="resub-toast" class="toast"></div>
+    </div>
   </div>
 
   <!-- ── PORTFOLIO URL ── -->
@@ -899,6 +911,22 @@ async function ingestVideos() {
     showToast('video-toast', '✕ ' + e.message, 'err');
   }
   spin('video-spinner', false);
+}
+
+async function resubscribeYoutube() {
+  spin('resub-spinner', true);
+  showToast('resub-toast', 'Contacting PubSubHubbub hub…', 'info');
+  try {
+    const res = await authFetch(API + '/youtube/resubscribe', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    if (data.warning) return showToast('resub-toast', '⚠ ' + data.warning, 'err');
+    const summary = data.resubscribed.map(r => `${r.channel_id}: HTTP ${r.http_status}`).join(', ');
+    showToast('resub-toast', `✓ Done — ${summary}`, 'ok');
+  } catch(e) {
+    showToast('resub-toast', '✕ ' + e.message, 'err');
+  }
+  spin('resub-spinner', false);
 }
 
 // ── PORTFOLIO URL ─────────────────────────────────────────────────────────

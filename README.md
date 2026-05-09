@@ -176,6 +176,8 @@ URL / file / YouTube URL / raw text
 | GET | `/admin/setup/status` | Check if admin password is configured |
 | POST | `/admin/setup` | Set initial admin password (one-time) |
 | GET | `/admin` | Admin UI (serves `ingest_ui.html` locally; JSON redirect in production) |
+| GET | `/youtube/notify` | YouTube PubSubHubbub verification (echoes `hub.challenge`) |
+| POST | `/youtube/notify` | YouTube push webhook — auto-ingests new videos |
 
 ### Admin (Bearer token required in production)
 
@@ -196,6 +198,7 @@ URL / file / YouTube URL / raw text
 | DELETE | `/sessions/{id}` | Clear one session |
 | DELETE | `/sessions` | Clear all sessions |
 | DELETE | `/index` | Wipe entire FAISS index |
+| POST | `/youtube/resubscribe` | Re-register channels with YouTube PubSubHubbub |
 
 ---
 
@@ -208,8 +211,11 @@ URL / file / YouTube URL / raw text
 | `YOUTUBE_API_KEY` | No | YouTube Data API v3 key (YouTube ingestion) |
 | `GOOGLE_CLOUD_PROJECT` | Prod only | GCP project ID — enables Firestore + auth |
 | `GCS_BUCKET` | Prod only | GCS bucket name for FAISS index persistence |
+| `WATCHED_CHANNEL_IDS` | PubSubHubbub | Comma-separated YouTube channel IDs to watch for new videos |
+| `PUBSUB_SECRET` | PubSubHubbub | HMAC secret for verifying YouTube push payloads (`openssl rand -hex 32`) |
 
 Set these in a `.env` file for local dev (loaded automatically via `python-dotenv`).
+`WATCHED_CHANNEL_IDS` and `PUBSUB_SECRET` should be set in the Cloud Run console for production.
 
 ---
 
@@ -278,6 +284,47 @@ gunicorn -k uvicorn.workers.UvicornWorker server:app \
 2. Open the admin frontend URL
 3. You will be prompted to set an admin password (stored as Argon2 hash in Firestore)
 4. Log in and start ingesting content via the admin panel
+
+---
+
+## YouTube PubSubHubbub (Auto-Ingestion)
+
+New videos published on watched channels are automatically transcribed and added to the FAISS index within ~30 seconds of upload — no polling, no manual action.
+
+### How it works
+1. YouTube pushes an Atom XML payload to `POST /youtube/notify` when a new video is published
+2. The endpoint parses the video ID, calls `ingest_videos`, and saves to GCS
+3. Subscriptions expire after 30 days — Cloud Scheduler re-registers every 15 days
+
+### Setup (one-time)
+
+**1. Set env vars in Cloud Run console:**
+
+| Variable | Value |
+|---|---|
+| `WATCHED_CHANNEL_IDS` | YouTube channel ID(s), comma-separated (e.g. `UCxxxxxxxxxxxxxx`) |
+| `PUBSUB_SECRET` | Random secret: `openssl rand -hex 32` |
+
+**2. Bootstrap the subscription** — click "Resubscribe YouTube" in the admin panel, or:
+```bash
+curl -X POST https://<cloud-run-url>/youtube/resubscribe \
+  -H "Authorization: Bearer <admin-password>"
+```
+YouTube calls `GET /youtube/notify` automatically to verify. Check logs for `PubSubHubbub subscribe: ... status=202`.
+
+**3. Create Cloud Scheduler job** (GCP Console → Cloud Scheduler → Create Job):
+
+| Field | Value |
+|---|---|
+| Frequency | `0 9 1,15 * *` (9am on 1st and 15th of every month) |
+| Target | HTTP POST `https://<cloud-run-url>/youtube/resubscribe` |
+| Header | `Authorization: Bearer <admin-password>` |
+
+### Finding a YouTube channel ID
+Go to the channel → View Page Source → search for `"channelId"`. Or use the YouTube Data API:
+```
+https://www.youtube.com/xml/feeds/videos.xml?channel_id=UCxxxxxxxxxxxxxx
+```
 
 ---
 
