@@ -1221,3 +1221,91 @@ def youtube_resubscribe(request: Request):
         logger.info("PubSubHubbub subscribe: channel=%s status=%d", cid, resp.status_code)
 
     return {"resubscribed": results}
+
+
+# ---------------------------------------------------------------------------
+# OneDrive weekly sync  (automatic new-file ingestion)
+# ---------------------------------------------------------------------------
+
+@app.post("/onedrive/sync")
+def onedrive_sync():
+    """
+    List files in the shared OneDrive folder, ingest any added/modified
+    since the last sync, and update the last_sync_time in Firestore.
+    Called weekly by Cloud Scheduler.
+    """
+    import base64
+    import requests as _req
+
+    share_url = os.environ.get("ONEDRIVE_SHARE_URL", "")
+    if not share_url:
+        return {"synced": 0, "warning": "ONEDRIVE_SHARE_URL not set"}
+
+    encoded = base64.urlsafe_b64encode(("u!" + share_url).encode()).decode().rstrip("=")
+    try:
+        resp = _req.get(
+            f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem/children",
+            params={"$select": "id,name,lastModifiedDateTime,file,@microsoft.graph.downloadUrl"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.error("onedrive_sync: Graph API error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"OneDrive API error: {exc}")
+
+    all_files = [item for item in resp.json().get("value", []) if "file" in item]
+
+    last_sync_time: Optional[str] = None
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    if project:
+        try:
+            db_fs = _firestore_client()
+            doc = db_fs.collection("system_config").document("onedrive_sync").get()
+            if doc.exists:
+                last_sync_time = doc.to_dict().get("last_sync_time")
+        except Exception as exc:
+            logger.warning("onedrive_sync: Firestore read failed: %s", exc)
+
+    new_files = [
+        f for f in all_files
+        if last_sync_time is None or f["lastModifiedDateTime"] > last_sync_time
+    ]
+
+    if not new_files:
+        return {"synced": 0, "message": "No new files since last sync"}
+
+    rag = _get_rag()
+    total_chunks = 0
+    synced_names = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for item in new_files:
+            download_url = item.get("@microsoft.graph.downloadUrl")
+            if not download_url:
+                logger.warning("onedrive_sync: no download URL for %s", item["name"])
+                continue
+            try:
+                file_bytes = _req.get(download_url, timeout=60).content
+                dest = os.path.join(tmpdir, item["name"])
+                Path(dest).write_bytes(file_bytes)
+                synced_names.append(item["name"])
+                logger.info("onedrive_sync: downloaded %s", item["name"])
+            except Exception as exc:
+                logger.warning("onedrive_sync: failed to download %s: %s", item["name"], exc)
+
+        if synced_names:
+            total_chunks = rag.ingest_folder(tmpdir, section="onedrive", recursive=False)
+
+    if total_chunks > 0:
+        _save_and_sync(rag)
+
+    if project:
+        try:
+            db_fs = _firestore_client()
+            db_fs.collection("system_config").document("onedrive_sync").set(
+                {"last_sync_time": datetime.now(timezone.utc).isoformat()}, merge=True
+            )
+        except Exception as exc:
+            logger.warning("onedrive_sync: Firestore write failed: %s", exc)
+
+    return {"synced": len(synced_names), "chunks_stored": total_chunks, "files": synced_names}
