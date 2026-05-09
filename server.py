@@ -1187,7 +1187,7 @@ async def youtube_notify(request: Request):
 
 
 @app.post("/youtube/resubscribe")
-def youtube_resubscribe(request: Request, _: AdminDep):
+def youtube_resubscribe(request: Request):
     """
     Re-registers all watched channels with PubSubHubbub.
     Hit once manually to bootstrap, then Cloud Scheduler calls it every 15 days.
