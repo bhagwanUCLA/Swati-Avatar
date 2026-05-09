@@ -367,7 +367,6 @@
     <button class="tab" onclick="switchTab(event, 'videos')">Videos</button>
     <button class="tab" onclick="switchTab(event, 'portfolio')">URL</button>
     <button class="tab" onclick="switchTab(event, 'cleanup')">Cleanup</button>
-    <button class="tab" onclick="switchTab(event, 'youtube')">YouTube</button>
   </div>
 
   <!-- ── PASTE DOCUMENTS (with inline cleaner) ── -->
@@ -648,24 +647,6 @@ copyright \d{4}"></textarea>
     <div id="cl-toast" class="toast"></div>
   </div>
 
-  <!-- ── YOUTUBE ── -->
-  <div id="panel-youtube" class="panel">
-    <div class="card">
-      <div class="card-title">YouTube PubSubHubbub</div>
-      <p style="font-size:13px;margin-bottom:14px;background:var(--blue-bg);color:var(--blue);padding:10px;border-radius:6px;">
-        Registers watched channels with YouTube's push notification service. New videos will be automatically ingested within ~30 seconds of upload. Run this once to bootstrap, then Cloud Scheduler handles renewals every 15 days.
-      </p>
-      <p style="font-size:13px;margin-bottom:14px;color:var(--muted)">
-        Requires <code>WATCHED_CHANNEL_IDS</code> and <code>PUBSUB_SECRET</code> to be set in Cloud Run environment variables.
-      </p>
-      <div class="btn-group">
-        <button class="btn btn-primary" onclick="resubscribeYoutube()">
-          <span id="yt-spinner"></span> Bootstrap / Resubscribe
-        </button>
-      </div>
-      <div id="yt-toast" class="toast"></div>
-    </div>
-  </div>
 </div>
 
 <script>
@@ -1303,25 +1284,6 @@ function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ── YOUTUBE ──────────────────────────────────────────────────────────────
-async function resubscribeYoutube() {
-  spin('yt-spinner', true);
-  showToast('yt-toast', 'Subscribing…', 'info');
-  try {
-    const res = await fetch(API + '/youtube/resubscribe', { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || res.statusText);
-    if (data.warning) {
-      showToast('yt-toast', '⚠ ' + data.warning, 'info');
-    } else {
-      const statuses = data.resubscribed.map(r => `${r.channel_id}: HTTP ${r.http_status}`).join(', ');
-      showToast('yt-toast', '✓ ' + statuses, 'ok');
-    }
-  } catch(e) {
-    showToast('yt-toast', '✕ ' + e.message, 'err');
-  }
-  spin('yt-spinner', false);
-}
 </script>
 </body>
 </html>
