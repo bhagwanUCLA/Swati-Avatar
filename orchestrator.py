@@ -338,6 +338,8 @@ class RAGOrchestrator:
                 mime_hint = _VIDEO_MIME.get(suffix) or _mt.guess_type(file_path.name)[0] or ""
                 if suffix == ".pdf":
                     mime_hint = "application/pdf"
+                if suffix in {".mp4a", ".m4a"}:    # <-- audio fix
+                    mime_hint = "audio/mp3"
 
                 logger.info("  [folder] Gemini extracting %s (%d KB)", file_path.name, len(file_bytes) // 1024)
                 title, content = extract_file_with_gemini(

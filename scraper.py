@@ -936,8 +936,27 @@ def extract_file_with_gemini(
 
         fd, tmp_path = tempfile.mkstemp(suffix=suffix or "")
         os.close(fd)
+
         with open(tmp_path, "wb") as fh:
             fh.write(file_bytes)
+        # Convert mp4a / m4a / mp4 audio to mp3 before uploading
+        if suffix in {".mp4a", ".m4a"}:
+            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", tmp_path,
+                    "-vn",
+                    "-codec:a", "libmp3lame",
+                    "-q:a", "2",
+                    mp3_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
         logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
         uploaded = gemini_client.files.upload(file=tmp_path)
@@ -990,11 +1009,11 @@ def extract_file_with_gemini(
                 "TITLE: <the presentation's title>\n\n"
                 "<slide-by-slide content: slide number, title and bullet points>"
             )
-        elif (mime_hint and "video" in mime_hint) or ext.endswith(
-            (".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp")
+        elif (mime_hint and ("video" in mime_hint or "audio" in mime_hint)) or ext.endswith(
+            (".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp", ".wav", ".mp3", ".aiff", ".ogg", ".flac")
         ):
             prompt = (
-                "You are extracting content from a video file.\n\n"
+                "You are extracting content from a video/audio file.\n\n"
                 "Output format (follow exactly):\n"
                 "TITLE: <the video's title or main topic>\n\n"
                 "<full transcript or detailed summary — include all spoken content, key points, and topics discussed>"
