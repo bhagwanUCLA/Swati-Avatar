@@ -45,6 +45,7 @@ import os
 import queue as _sync_queue
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+import requests as _req
 
 import jwt
 from typing import Annotated, AsyncGenerator, Optional
@@ -67,7 +68,11 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Portfolio RAG API", version="3.0")
@@ -1192,7 +1197,7 @@ def youtube_resubscribe(request: Request):
     Re-registers all watched channels with PubSubHubbub.
     Hit once manually to bootstrap, then Cloud Scheduler calls it every 15 days.
     """
-    import requests as _req
+    
 
     channel_ids = [
         c.strip()
@@ -1226,16 +1231,14 @@ def youtube_resubscribe(request: Request):
 # ---------------------------------------------------------------------------
 # OneDrive weekly sync  (automatic new-file ingestion)
 # ---------------------------------------------------------------------------
-
 @app.post("/onedrive/sync")
 def onedrive_sync():
     """
-    List files in the shared OneDrive folder, ingest any added/modified
+    List files in the shared OneDrive folder, ingest any added/modified .m4a files
     since the last sync, and update the last_sync_time in Firestore.
     Called weekly by Cloud Scheduler.
     """
     import base64
-    import requests as _req
 
     share_url = os.environ.get("ONEDRIVE_SHARE_URL", "")
     if not share_url:
@@ -1253,7 +1256,11 @@ def onedrive_sync():
         logger.error("onedrive_sync: Graph API error: %s", exc)
         raise HTTPException(status_code=502, detail=f"OneDrive API error: {exc}")
 
-    all_files = [item for item in resp.json().get("value", []) if "file" in item]
+    # MODIFICATION: Strictly filter for files ending in .m4a (case-insensitive)
+    all_files = [
+        item for item in resp.json().get("value", []) 
+        if "file" in item and item.get("name", "").lower().endswith(".m4a")
+    ]
 
     last_sync_time: Optional[str] = None
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
@@ -1272,7 +1279,7 @@ def onedrive_sync():
     ]
 
     if not new_files:
-        return {"synced": 0, "message": "No new files since last sync"}
+        return {"synced": 0, "message": "No new .m4a files since last sync"}
 
     rag = _get_rag()
     total_chunks = 0
@@ -1285,15 +1292,22 @@ def onedrive_sync():
                 logger.warning("onedrive_sync: no download URL for %s", item["name"])
                 continue
             try:
-                file_bytes = _req.get(download_url, timeout=60).content
+                # Stream the download just to be safe with memory
+                response = _req.get(download_url, stream=True, timeout=60)
+                response.raise_for_status()
+                
                 dest = os.path.join(tmpdir, item["name"])
-                Path(dest).write_bytes(file_bytes)
+                with open(dest, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
                 synced_names.append(item["name"])
                 logger.info("onedrive_sync: downloaded %s", item["name"])
             except Exception as exc:
                 logger.warning("onedrive_sync: failed to download %s: %s", item["name"], exc)
 
         if synced_names:
+            # rag.ingest_folder will now only see the .m4a files downloaded
             total_chunks = rag.ingest_folder(tmpdir, section="onedrive", recursive=False)
 
     if total_chunks > 0:
@@ -1309,3 +1323,150 @@ def onedrive_sync():
             logger.warning("onedrive_sync: Firestore write failed: %s", exc)
 
     return {"synced": len(synced_names), "chunks_stored": total_chunks, "files": synced_names}
+
+# ---------------------------------------------------------------------------
+# Blog weekly sync  (automatic new-blog ingestion)
+# ---------------------------------------------------------------------------
+@app.post("/blogs/sync")
+def blogs_sync():
+    """
+    Fetch blogs from the external CMS, filter for new posts since the last run,
+    and process them natively using the appropriate RAG pipeline strategy.
+    Called weekly by Cloud Scheduler.
+    """
+
+    import urllib3
+
+    # Suppress insecure request warnings caused by the expired CMS SSL cert
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # 1. Look up the last execution checkpoint from Firestore
+    last_sync_time: Optional[str] = None
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    
+    if project:
+        try:
+            db_fs = _firestore_client()
+            doc = db_fs.collection("system_config").document("blog_sync").get()
+            if doc.exists:
+                last_sync_time = doc.to_dict().get("last_sync_time")
+        except Exception as exc:
+            logger.warning("blogs_sync: Firestore read failed: %s", exc)
+
+    # Convert checkpoint string to datetime if it exists
+    last_sync_datetime = None
+    if last_sync_time:
+        last_sync_datetime = datetime.fromisoformat(last_sync_time.split("+")[0])
+
+    # 2. Query the external CMS API
+    api_url = os.environ.get("SWATI_DESAI_API")
+    payload = {"pageIndex": 0, "pageSize": 100}
+    headers = {"accept": "text/plain", "Content-Type": "application/json"}
+
+    try:
+        resp = _req.post(api_url, json=payload, headers=headers, verify=False, timeout=30)
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.error("blogs_sync: CMS API connectivity error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Blog CMS API error: {exc}")
+
+    all_blogs = resp.json().get("data", [])
+    new_blogs = []
+
+    # Filter out entries already processed
+    for blog in all_blogs:
+        updated_date_str = blog.get("updatedDate") or blog.get("createdDate")
+        if not updated_date_str:
+            continue
+        
+        blog_datetime = datetime.fromisoformat(updated_date_str)
+        if last_sync_datetime is None or blog_datetime > last_sync_datetime:
+            new_blogs.append((blog, blog_datetime))
+
+    if not new_blogs:
+        return {"synced": 0, "message": "No new blog entries discovered since last sync."}
+
+    rag = _get_rag()
+    total_chunks = 0
+    processed_titles = []
+    newest_timestamp = last_sync_datetime or datetime.fromisoformat("1970-01-01T00:00:00")
+
+    # Arrays to isolate batch workloads
+    raw_text_docs = []
+
+    # 3. Process each unique new blog
+    for blog, blog_datetime in new_blogs:
+        title = blog.get("name", "Untitled Blog")
+        pdf_url = blog.get("document")
+
+        # --- Pipeline Strategy Selection ---
+        if pdf_url and pdf_url.strip():
+            # STRATEGY A: PDF Document Present -> Use Folder Ingestion Pipeline Logic
+            logger.info("blogs_sync: processing via PDF pipeline -> %s", title)
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    pdf_resp = _req.get(pdf_url, stream=True, timeout=60)
+                    pdf_resp.raise_for_status()
+                    
+                    # Create a clean safe filename from the blog ID or Title
+                    safe_filename = f"{blog.get('id', 'doc')}.pdf"
+                    dest = os.path.join(tmpdir, safe_filename)
+                    
+                    with open(dest, "wb") as f:
+                        for chunk in pdf_resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    # Natively route through folder chunker pipeline
+                    chunks = rag.ingest_folder(tmpdir, section="blogs", recursive=False)
+                    total_chunks += chunks
+                    processed_titles.append(f"[PDF] {title}")
+            except Exception as exc:
+                logger.error("blogs_sync: failed to download document for %s: %s", title, exc)
+                continue
+        else:
+            # STRATEGY B: No Document -> Compile Text Data and Use Raw Document Pipeline
+            logger.info("blogs_sync: processing via Raw Text pipeline -> %s", title)
+            sub_desc = blog.get("subDescription") or ""
+            desc = blog.get("description") or ""
+            
+            # Combine the body text components natively
+            full_text = f"{sub_desc}\n\n{desc}".strip()
+            
+            raw_text_docs.append({
+                "title": title,
+                "text": full_text if full_text else "No content available."
+            })
+            processed_titles.append(f"[Text] {title}")
+
+        # Track the absolute newest date boundary encountered
+        if blog_datetime > newest_timestamp:
+            newest_timestamp = blog_datetime
+
+    # Process all text-based items collectively if any were bundled
+    if raw_text_docs:
+        chunks = rag.ingest_raw_documents(raw_text_docs)
+        total_chunks += chunks
+
+    # 4. Save and commit index vector adjustments if changes occurred
+    if total_chunks > 0:
+        _save_and_sync(rag)
+
+    # 5. Flush state progress timestamp to Firestore
+    if project:
+        try:
+            db_fs = _firestore_client()
+            db_fs.collection("system_config").document("blog_sync").set(
+                {
+                    "last_sync_time": newest_timestamp.isoformat(),
+                    "execution_ran_at": datetime.now(timezone.utc).isoformat()
+                }, 
+                merge=True
+            )
+        except Exception as exc:
+            logger.warning("blogs_sync: Firestore checkpoint save failed: %s", exc)
+
+    return {
+        "synced": len(processed_titles),
+        "chunks_stored": total_chunks,
+        "processed_items": processed_titles
+    }

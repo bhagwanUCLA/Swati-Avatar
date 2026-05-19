@@ -58,7 +58,7 @@ _BINARY_EXTENSIONS = {
 }
 
 _VIDEO_EXTENSIONS = {
-    ".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp",
+    ".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp", ".m4a"
 }
 
 _VIDEO_MIME = {
@@ -72,6 +72,12 @@ _VIDEO_MIME = {
     ".wmv":  "video/wmv",
     ".3gp":  "video/3gpp",
     ".3gpp": "video/3gpp",
+    ".mp3":  "audio/mp3",
+    ".wav":  "audio/wav",
+    ".aiff": "audio/aiff",
+    ".ogg":  "audio/ogg",
+    ".flac": "audio/flac",
+    ".m4a":  "audio/mp3",
 }
 
 _ALL_SUPPORTED = _TEXT_EXTENSIONS | _BINARY_EXTENSIONS | _VIDEO_EXTENSIONS
@@ -315,7 +321,7 @@ class RAGOrchestrator:
                 logger.warning("Failed to read %s: %s", file_path, exc)
                 return None
 
-        # ── Binary / video files — Gemini extraction + local PDF fallback ──
+        # ── Binary / video files / audio — Gemini extraction + local PDF fallback ──
         if suffix in _BINARY_EXTENSIONS or suffix in _VIDEO_EXTENSIONS:
             try:
                 import mimetypes as _mt
@@ -338,8 +344,6 @@ class RAGOrchestrator:
                 mime_hint = _VIDEO_MIME.get(suffix) or _mt.guess_type(file_path.name)[0] or ""
                 if suffix == ".pdf":
                     mime_hint = "application/pdf"
-                if suffix in {".mp4a", ".m4a"}:    # <-- audio fix
-                    mime_hint = "audio/mp3"
 
                 logger.info("  [folder] Gemini extracting %s (%d KB)", file_path.name, len(file_bytes) // 1024)
                 title, content = extract_file_with_gemini(

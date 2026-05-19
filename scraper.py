@@ -19,18 +19,16 @@ USAGE:
 """
 from __future__ import annotations
 
-import collections
-import concurrent.futures
 import threading
 import hashlib
 import io
 import json
 import logging
 import os
-import random
 import re
 import tempfile
-import time
+import subprocess
+
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,7 +41,6 @@ from google import genai
 from google.genai import types
 
 import asyncio
-import aiohttp
 import nest_asyncio
 from playwright.async_api import async_playwright, Page, Browser, Response as PlaywrightResponse
 from googleapiclient.discovery import build
@@ -958,8 +955,11 @@ def extract_file_with_gemini(
                 stderr=subprocess.DEVNULL,
             )
 
-        logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
-        uploaded = gemini_client.files.upload(file=tmp_path)
+            logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
+            uploaded = gemini_client.files.upload(file=mp3_path)
+        else:
+            logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
+            uploaded = gemini_client.files.upload(file=tmp_path)
 
         import time
         while True:
@@ -1010,7 +1010,7 @@ def extract_file_with_gemini(
                 "<slide-by-slide content: slide number, title and bullet points>"
             )
         elif (mime_hint and ("video" in mime_hint or "audio" in mime_hint)) or ext.endswith(
-            (".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp", ".wav", ".mp3", ".aiff", ".ogg", ".flac")
+            (".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".flv", ".webm", ".wmv", ".3gp", ".3gpp", ".wav", ".mp3", ".aiff", ".ogg", ".flac", ".m4a")
         ):
             prompt = (
                 "You are extracting content from a video/audio file.\n\n"
@@ -1028,25 +1028,14 @@ def extract_file_with_gemini(
 
         raw_text = ""
         try:
-            contents = types.Content(parts=[
-                types.Part(file_data=types.FileData(
-                    file_uri=getattr(uploaded, "uri", getattr(uploaded, "name", None)),
-                    mime_type=mime_type or None,
-                )),
-                types.Part(text=prompt),
-            ])
-            response = gemini_client.models.generate_content(model=model, contents=contents)
+            logger.info(" %s, %s, %s", filename, ext, mime_type)
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=[prompt, uploaded],
+            )
             raw_text = getattr(response, "text", "") or ""
         except Exception as exc:
             logger.warning("generate_content(parts=…) failed; trying fallback: %s", exc)
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=[uploaded, prompt],
-                )
-                raw_text = getattr(response, "text", "") or ""
-            except Exception as exc2:
-                logger.error("Gemini generate_content failed for %s: %s", source_url, exc2)
 
         # Best-effort delete uploaded file
         try:
@@ -1068,6 +1057,11 @@ def extract_file_with_gemini(
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
+            except Exception:
+                pass
+        if mp3_path and os.path.exists(mp3_path):
+            try:
+                os.remove(mp3_path)
             except Exception:
                 pass
 
