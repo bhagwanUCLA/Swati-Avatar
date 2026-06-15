@@ -303,6 +303,80 @@ _DEFAULT_CONFIG = {
 _current_config: dict             = dict(_DEFAULT_CONFIG)
 _rag:            Optional[RAGOrchestrator] = None
 
+# Model cache: {models: [...], timestamp: ...}
+_model_cache: dict = {"models": None, "timestamp": None}
+_MODEL_CACHE_TTL = 300  # 5 minutes
+
+
+def _load_model_from_firestore() -> Optional[str]:
+    """Load saved model from Firestore, or None if not found/not configured."""
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
+        return None
+    try:
+        db = _firestore_client()
+        doc = db.collection("system_config").document("admin").get()
+        if doc.exists:
+            return doc.to_dict().get("model")
+    except Exception as exc:
+        logger.warning("Failed to load model from Firestore: %s", exc)
+    return None
+
+
+def _save_model_to_firestore(model: str) -> None:
+    """Save selected model to Firestore."""
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
+        return
+    try:
+        db = _firestore_client()
+        db.collection("system_config").document("admin").set(
+            {"model": model}, merge=True
+        )
+    except Exception as exc:
+        logger.error("Failed to save model to Firestore: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Firestore write failed: {exc}")
+
+
+def _fetch_anthropic_models() -> list[dict]:
+    """Fetch available Anthropic models and filter for chat models. Caches for 5 min."""
+    now = datetime.now(timezone.utc)
+
+    # Return cached models if still valid
+    if (_model_cache["models"] is not None and
+        _model_cache["timestamp"] is not None and
+        (now - _model_cache["timestamp"]).total_seconds() < _MODEL_CACHE_TTL):
+        return _model_cache["models"]
+
+    try:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            logger.error("ANTHROPIC_API_KEY not set — cannot fetch models")
+            return []
+
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key)
+
+        page = client.models.list()
+        all_models = page.data
+
+        # Filter for chat models (type == "model" and not embedding models)
+        chat_models = [
+            {"id": m.id, "display_name": getattr(m, "display_name", m.id)}
+            for m in all_models
+            if getattr(m, "type", None) == "model" and "embed" not in m.id.lower()
+        ]
+
+        # Sort by id for consistent ordering
+        chat_models.sort(key=lambda x: x["id"])
+
+        # Cache the result
+        _model_cache["models"] = chat_models
+        _model_cache["timestamp"] = now
+
+        return chat_models
+    except Exception as exc:
+        logger.error("Failed to fetch Anthropic models: %s", exc)
+        return []
+
 
 def _get_rag() -> RAGOrchestrator:
     global _rag
@@ -438,6 +512,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SetModelRequest(BaseModel):
+    model: str
+
+
 class IngestRequest(BaseModel):
     url:     str
     rebuild: bool = False
@@ -556,12 +634,13 @@ def _run_llm_in_thread(
 @app.on_event("startup")
 async def startup_event():
     """
-    On container start: 
+    On container start:
     1. Load admin password hash from DB.
-    2. Download the FAISS index from GCS (if configured).
+    2. Load model selection from Firestore.
+    3. Download the FAISS index from GCS (if configured).
     """
-    global _cached_admin_hash
-    
+    global _cached_admin_hash, _current_config
+
     # --- 1. Password Setup ---
     try:
         _cached_admin_hash = _get_admin_hash_from_db()
@@ -574,6 +653,22 @@ async def startup_event():
             "Startup: Firestore read failed — server will start but admin auth "
             "will return 503 until DB is reachable. Error: %s", exc
         )
+
+    # --- 1b. Load Model ---
+    try:
+        saved_model = _load_model_from_firestore()
+        if saved_model and saved_model.strip():
+            _current_config["model"] = saved_model.strip()
+            logger.info("Startup: model loaded from Firestore: %s", saved_model)
+        else:
+            logger.info("Startup: using default model: %s", _current_config["model"])
+    except Exception as exc:
+        logger.warning("Startup: failed to load model from Firestore, using default: %s", exc)
+
+    # Validate that we have a model configured
+    if not _current_config.get("model"):
+        logger.error("Startup: no model configured, falling back to claude-sonnet-4-6")
+        _current_config["model"] = "claude-sonnet-4-6"
 
     # --- 2. GCS FAISS Download ---
     bucket = _current_config.get("gcs_bucket", "")
@@ -880,6 +975,44 @@ def firestore_test(_: AdminDep):
             "--member=serviceAccount:SA_EMAIL --role=roles/datastore.user"
         )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=results)
+
+
+@app.get("/admin/config/model")
+def get_model(_: AdminDep):
+    """Get the currently selected Anthropic model."""
+    return {"model": _current_config.get("model", "claude-sonnet-4-6")}
+
+
+@app.get("/admin/models/available")
+def list_models(_: AdminDep):
+    """Get list of available Anthropic chat models."""
+    models = _fetch_anthropic_models()
+    if not models:
+        logger.warning("No models available — Anthropic API may be unreachable.")
+    return {"models": models}
+
+
+@app.post("/admin/config/model")
+def set_model(body: SetModelRequest, _: AdminDep):
+    """Update the selected Anthropic model."""
+    model = body.model.strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="Model name is required.")
+
+    # Validate that it's a chat model (not embedding, etc.)
+    available = _fetch_anthropic_models()
+    available_ids = [m["id"] for m in available]
+    if model not in available_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' is not available. Must be one of: {', '.join(available_ids)}"
+        )
+
+    # Save to Firestore and update in-memory config
+    _save_model_to_firestore(model)
+    _current_config["model"] = model
+    logger.info("Admin updated model to: %s", model)
+    return {"success": True, "model": model}
 
 
 # ---------------------------------------------------------------------------

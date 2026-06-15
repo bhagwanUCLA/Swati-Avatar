@@ -11,8 +11,8 @@ No local model is loaded — all embedding is done via API call.
 
 Hybrid Search
 -------------
-Combines FAISS (Cosine Similarity, weight 0.8) and BM25 (weight 0.2).
-Retrieves candidate pools from both dense and sparse indexes, min-max normalises 
+Combines FAISS (Cosine Similarity, weight 0.7) and BM25 (weight 0.3).
+Retrieves candidate pools from both dense and sparse indexes, min-max normalises
 their scores to a [0,1] scale, and combines them for the final ranking.
 """
 from __future__ import annotations
@@ -340,7 +340,7 @@ class FAISSDatabase:
             nd_score = _normalize(d_score, d_min, d_max)
             ns_score = _normalize(s_score, s_min, s_max)
 
-            # Combined score: 60% Dense, 40% Sparse
+            # Combined score: 70% Dense (FAISS), 30% Sparse (BM25)
             final_score = (0.7 * nd_score) + (0.3 * ns_score)
 
             results.append({

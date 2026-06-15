@@ -28,6 +28,7 @@ import os
 import re
 import tempfile
 import subprocess
+import time
 
 from copy import copy
 from dataclasses import dataclass, field
@@ -923,6 +924,7 @@ def extract_file_with_gemini(
         return fallback_title, ""
 
     tmp_path: Optional[str] = None
+    mp3_path: Optional[str] = None
     uploaded = None
     try:
         suffix = ""
@@ -961,7 +963,6 @@ def extract_file_with_gemini(
             logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
             uploaded = gemini_client.files.upload(file=tmp_path)
 
-        import time
         while True:
             file_info = gemini_client.files.get(name=uploaded.name)
             state_str = str(file_info.state).upper()
@@ -1036,6 +1037,14 @@ def extract_file_with_gemini(
             raw_text = getattr(response, "text", "") or ""
         except Exception as exc:
             logger.warning("generate_content(parts=…) failed; trying fallback: %s", exc)
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=[uploaded, prompt],
+                )
+                raw_text = getattr(response, "text", "") or ""
+            except Exception as exc2:
+                logger.error("Gemini generate_content failed for %s: %s", source_url, exc2)
 
         # Best-effort delete uploaded file
         try:

@@ -118,7 +118,11 @@ class RAGOrchestrator:
                 os.path.dirname(os.path.abspath(index_dir)), "scraper_cache"
             )
 
-        self.cache = ScraperCache(cache_dir)
+        try:
+            self.cache = ScraperCache(cache_dir)
+        except Exception as exc:
+            logger.error("Failed to initialize scraper cache at %s: %s", cache_dir, exc)
+            raise ValueError(f"Cannot initialize cache directory: {cache_dir}") from exc
 
         self.scraper = PortfolioScraper(
             gemini_api_key=gemini_api_key,
@@ -331,14 +335,13 @@ class RAGOrchestrator:
                     return None
 
                 # ── Cache hit: skip Gemini if we already extracted this file ─
-                if self.cache:
-                    cached = self.cache.get_local_file(url)
-                    if cached:
-                        cached_title = cached["title"] or file_path.stem
-                        cached_text  = cached["text"]
-                        if cached_text:
-                            logger.info("  [folder cache HIT] %s", file_path.name)
-                            return self._make_aux_doc(cached_title, section, url, cached_text, "text")
+                cached = self.cache.get_local_file(url)
+                if cached:
+                    cached_title = cached["title"] or file_path.stem
+                    cached_text  = cached["text"]
+                    if cached_text:
+                        logger.info("  [folder cache HIT] %s", file_path.name)
+                        return self._make_aux_doc(cached_title, section, url, cached_text, "text")
 
                 # Derive an accurate MIME type so Gemini picks the right prompt
                 mime_hint = _VIDEO_MIME.get(suffix) or _mt.guess_type(file_path.name)[0] or ""
@@ -373,12 +376,11 @@ class RAGOrchestrator:
                     return None
 
                 # ── Cache the extracted content so re-runs skip Gemini ────────
-                if self.cache:
-                    self.cache.set_local_file(
-                        url=url,
-                        title=title or file_path.stem,
-                        text=content,
-                    )
+                self.cache.set_local_file(
+                    url=url,
+                    title=title or file_path.stem,
+                    text=content,
+                )
 
                 return self._make_aux_doc(
                     title or file_path.stem, section, url, content, "text"
@@ -411,9 +413,10 @@ class RAGOrchestrator:
             content = (item.get("content") or "").strip()
             if not content:
                 continue
+            section = (item.get("section") or "").strip() or "general"
             doc = self._make_aux_doc(
                 title    = item.get("title", "Untitled"),
-                section  = item.get("section", "general"),
+                section  = section,
                 url      = item.get("url", ""),
                 content  = content,
                 doc_type = item.get("doc_type", "text"),

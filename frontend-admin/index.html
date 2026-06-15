@@ -359,6 +359,26 @@
 <div class="container">
   <p class="subtitle">Manage documents, videos, and the knowledge index.</p>
 
+  <!-- Model Selector (admin only) -->
+  <div id="modelSelector" style="display:none; margin-bottom: 20px; padding: 15px; background: var(--bg-secondary); border-radius: 8px; border: 1px solid var(--border);">
+    <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+      <div>
+        <label style="font-weight: 500; display: block; margin-bottom: 5px;">Current Model</label>
+        <span id="currentModel" style="color: var(--text);">Loading...</span>
+      </div>
+      <div>
+        <label style="font-weight: 500; display: block; margin-bottom: 5px; margin-top: 0;">Select Model</label>
+        <select id="modelDropdown" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 14px;" disabled>
+          <option>Loading available models...</option>
+        </select>
+      </div>
+      <button id="saveModelBtn" style="padding: 8px 16px; margin-top: 23px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px;" disabled>
+        Save Model
+      </button>
+      <span id="modelStatus" style="color: var(--muted); font-size: 13px; margin-top: 23px;"></span>
+    </div>
+  </div>
+
   <div class="tabs">
     <button class="tab active" onclick="switchTab(event, 'index')">Index</button>
     <button class="tab" onclick="switchTab(event, 'chats')">Chats</button>
@@ -1098,9 +1118,116 @@ function simpleMd(text) {
     .replace(/\n/g, '<br>');
 }
 
+// ── MODEL SELECTOR ────────────────────────────────────────────────────────
+async function initModelSelector() {
+  try {
+    // Show the model selector (only visible to authenticated admins)
+    document.getElementById('modelSelector').style.display = 'block';
+
+    // Fetch current model
+    const currentRes = await authFetch(API + '/admin/config/model');
+    if (currentRes.status === 401) {
+      document.getElementById('modelStatus').textContent = 'Session expired. Please log in again.';
+      document.getElementById('modelStatus').style.color = 'var(--red)';
+      return;
+    }
+    if (currentRes.ok) {
+      const data = await currentRes.json();
+      document.getElementById('currentModel').textContent = data.model;
+    }
+
+    // Fetch available models
+    const availRes = await authFetch(API + '/admin/models/available');
+    if (availRes.status === 401) {
+      document.getElementById('modelStatus').textContent = 'Session expired. Please log in again.';
+      document.getElementById('modelStatus').style.color = 'var(--red)';
+      return;
+    }
+    if (availRes.ok) {
+      const data = await availRes.json();
+      const dropdown = document.getElementById('modelDropdown');
+      dropdown.innerHTML = '';
+      if (data.models && data.models.length > 0) {
+        data.models.forEach(m => {
+          const option = document.createElement('option');
+          option.value = m.id;
+          option.textContent = m.display_name || m.id;
+          dropdown.appendChild(option);
+        });
+        dropdown.disabled = false;
+        document.getElementById('saveModelBtn').disabled = false;
+      } else {
+        dropdown.innerHTML = '<option>No models available</option>';
+      }
+    } else {
+      console.error('Failed to fetch available models:', availRes.status);
+      const statusMsg = availRes.status === 503 ? 'Backend service unavailable' : 'Error loading models';
+      document.getElementById('modelStatus').textContent = statusMsg;
+      document.getElementById('modelStatus').style.color = 'var(--red)';
+    }
+
+    // Setup save button handler
+    document.getElementById('saveModelBtn').onclick = saveModel;
+  } catch (err) {
+    console.error('Model selector initialization failed:', err);
+    document.getElementById('modelStatus').textContent = 'Error initializing model selector';
+    document.getElementById('modelStatus').style.color = 'var(--red)';
+  }
+}
+
+async function saveModel() {
+  const dropdown = document.getElementById('modelDropdown');
+  const model = dropdown.value;
+  const statusEl = document.getElementById('modelStatus');
+  const saveBtn = document.getElementById('saveModelBtn');
+
+  if (!model) {
+    statusEl.textContent = 'Please select a model';
+    return;
+  }
+
+  saveBtn.disabled = true;
+  statusEl.textContent = 'Saving...';
+
+  try {
+    const res = await authFetch(API + '/admin/config/model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model })
+    });
+
+    if (res.status === 401) {
+      throw new Error('Session expired. Please log in again.');
+    }
+
+    if (!res.ok) {
+      const error = await res.json();
+      throw new Error(error.detail || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    document.getElementById('currentModel').textContent = data.model;
+    statusEl.textContent = 'Model updated successfully!';
+    statusEl.style.color = 'var(--green)';
+    setTimeout(() => {
+      statusEl.textContent = '';
+      statusEl.style.color = 'var(--muted)';
+    }, 3000);
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+    statusEl.style.color = 'var(--red)';
+    console.error('Failed to save model:', err);
+  } finally {
+    saveBtn.disabled = false;
+  }
+}
+
 // ── INDEX ─────────────────────────────────────────────────────────────────
 async function loadIndex() {
   try {
+    // Initialize model selector
+    await initModelSelector();
+
     const res = await authFetch(API + '/stats');
     const s = await res.json();
     document.getElementById('st-chunks').textContent  = (s.total_chunks   || 0).toLocaleString();
