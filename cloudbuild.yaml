@@ -28,13 +28,20 @@
 #   roles/storage.objectAdmin on the GCS bucket
 
 substitutions:
-  _REGION:       asia-south1
-  _SERVICE_NAME: swati-avatar
-  _PROJECT_ID:   meditate-with-swati-desai
-  _REPO:         cloud-run-source-deploy
-  _GCS_BUCKET:   swati-rag-index
-  _IMAGE:        asia-south1-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_SERVICE_NAME}
-  _FIRESTORE_DB: swati-chats
+  _REGION:              asia-south1
+  _SERVICE_NAME:        swati-avatar
+  _PROJECT_ID:          meditate-with-swati-desai
+  _REPO:                cloud-run-source-deploy
+  _GCS_BUCKET:          swati-rag-index
+  _IMAGE:               asia-south1-docker.pkg.dev/${_PROJECT_ID}/${_REPO}/${_SERVICE_NAME}
+  _FIRESTORE_DB:        swati-chats
+  _MAILJET_API_KEY:     ""
+  _MAILJET_SECRET_KEY:  ""
+  _MAILJET_FROM_EMAIL:  ""
+  _ADMIN_EMAIL:         ""
+  _ADMIN_FRONTEND_URL:  ""
+  _GDRIVE_FOLDER_ID:    ""
+  _GDRIVE_SERVICE_ACCOUNT_FILE: ""
 steps:
   # ── 1. Build Docker image ─────────────────────────────────────────────────
   - name: gcr.io/cloud-builders/docker
@@ -53,6 +60,22 @@ steps:
       - --all-tags
       - ${_IMAGE}
 
+  # ── 2.5. Create Firestore index for password_resets (idempotent) ─────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - firestore
+      - indexes
+      - composite
+      - create
+      - --collection-group=password_resets
+      - --field-config=field-path=token_hash,order=ASCENDING
+      - --field-config=field-path=used,order=ASCENDING
+      - --field-config=field-path=expires_at,order=ASCENDING
+      - --database=${_FIRESTORE_DB}
+      - --project=${_PROJECT_ID}
+    allowFailure: true
+
   # ── 3. Deploy to Cloud Run ────────────────────────────────────────────────
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: gcloud
@@ -67,7 +90,7 @@ steps:
       - --memory=2Gi
       - --cpu=2
       - --timeout=300
-      - --update-env-vars=GOOGLE_CLOUD_PROJECT=${_PROJECT_ID},GCS_BUCKET=${_GCS_BUCKET},FIRESTORE_DB=${_FIRESTORE_DB}
+      - --update-env-vars=GOOGLE_CLOUD_PROJECT=${_PROJECT_ID},GCS_BUCKET=${_GCS_BUCKET},FIRESTORE_DB=${_FIRESTORE_DB},MAILJET_API_KEY=${_MAILJET_API_KEY},MAILJET_SECRET_KEY=${_MAILJET_SECRET_KEY},MAILJET_FROM_EMAIL=${_MAILJET_FROM_EMAIL},ADMIN_EMAIL=${_ADMIN_EMAIL},ADMIN_FRONTEND_URL=${_ADMIN_FRONTEND_URL},GDRIVE_FOLDER_ID=${_GDRIVE_FOLDER_ID},GDRIVE_SERVICE_ACCOUNT_FILE=${_GDRIVE_SERVICE_ACCOUNT_FILE}
       - --quiet
 
 images:

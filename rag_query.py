@@ -83,6 +83,9 @@ Act as **Dr. Swati Desai**, a PhD in Management from UCLA Anderson School of Man
 ### **IMPORTANT NOTE**
 If your answer came from your general training knowledge, not from my portfolio database, say so explicitly. Do not wait for the reader to prod you first.
 
+### **DISCLAIMER**
+**Please note:** All information provided is educational and suggestive in nature only. It is **not** professional medical, psychological, or therapeutic advice. Users should not rely on this content as a substitute for professional medical, mental health, or legal counsel. Always consult with a qualified healthcare provider or licensed professional before making decisions based on this information. The information provided does not establish a professional relationship with Dr. Swati Desai.
+
 """)
 
 

@@ -1,6 +1,30 @@
-# Portfolio RAG — Project Documentation
+# 2Meditate RAG Chatbot — Project Documentation
 
-A Retrieval-Augmented Generation (RAG) system for the portfolio of **Bhagwan Chowdhry** (Finance Professor, ISB / UCLA). Users chat with an AI assistant that answers questions grounded in the professor's publications, videos, and web content.
+A Retrieval-Augmented Generation (RAG) system for **Dr. Swati Desai** (2Meditate). Users chat with an AI assistant that answers questions grounded in her mindfulness teachings, psychological insights, and content from her website, YouTube, PDFs, and ingested documents.
+
+---
+
+## Quick Start
+
+```bash
+# 1. Install + cache playwright
+pip install -r requirements.txt
+playwright install chromium
+
+# 2. Create .env with API keys
+echo "GEMINI_API_KEY=your_key" > .env
+echo "ANTHROPIC_API_KEY=your_key" >> .env
+echo "YOUTUBE_API_KEY=optional" >> .env
+
+# 3. Run server (no auth locally)
+uvicorn server:app --reload --port 8000
+
+# 4. Open browser
+# Chat: http://localhost:8000
+# Admin: http://localhost:8000/admin
+```
+
+**Local mode**: No Firestore needed, no password required, FAISS stored in `./rag_index/`.
 
 ---
 
@@ -65,40 +89,43 @@ Firestore (production persistence)
 ## Components
 
 ### `server.py` — FastAPI Backend
-- Serves both public and admin API endpoints
-- **Admin auth**: Bearer token (plaintext password) verified against Argon2 hash stored in Firestore. Local dev bypasses auth entirely when `GOOGLE_CLOUD_PROJECT` is unset.
-- **Streaming**: Anthropic SDK is synchronous; `_run_llm_in_thread()` runs it in a `ThreadPoolExecutor` and feeds tokens into a `queue.Queue`. The async `event_stream()` polls the queue, keeping the event loop free.
-- **GCS sync**: Downloads FAISS index from GCS on startup; uploads after every ingest operation.
-- **Session store**: Firestore in production, in-memory dict in local dev.
+- **50+ endpoints**: Public chat, admin ingestion, auth, YouTube webhooks, session/document management.
+- **Admin auth**: Bearer token validated against Argon2 hash in Firestore (production). Auth bypassed in local dev when `GOOGLE_CLOUD_PROJECT` unset.
+- **Streaming architecture**: Anthropic SDK is blocking; `_run_llm_in_thread()` runs it in a `ThreadPoolExecutor`, feeding tokens into a thread-safe `queue.Queue`. Async `event_stream()` polls queue with short sleeps, keeping event loop responsive for other requests.
+- **GCS persistence**: FAISS index downloaded on startup, uploaded after every ingest.
+- **Session store**: Firestore (production) or in-memory dict (local dev).
+- **YouTube webhooks**: PubSubHubbub push notifications trigger auto-ingestion of new videos.
 
 ### `orchestrator.py` — RAGOrchestrator
-Central coordinator. Wires together the scraper, chunker, and database. All ingestion paths converge at `_store_docs()`:
-1. Filter corrupt content (binary junk check)
-2. Chunk via `DocumentChunker`
-3. Optional embedding-based deduplication
-4. Upsert into `FAISSDatabase` (delete old chunks for same URL first)
-5. Remove short chunks (`< min_tokens`)
+Central ingestion coordinator. Routes all content (websites, YouTube, files, raw text) through a unified pipeline:
+- **Corruption guard**: Detects binary junk (excessive control characters) and skips corrupt content
+- **Chunking**: Splits documents into 3500-token chunks with 50-token overlap
+- **Deduplication**: Optional O(n²) cosine-similarity check before indexing
+- **Upsert semantics**: Deletes old chunks for the same URL before storing new ones (prevents duplicates on re-ingest)
+- **Quality filtering**: Removes chunks below minimum token count and applies optional regex/keyword filters
 
 ### `scraper.py` — PortfolioScraper
-Handles all web ingestion:
-- **WebsiteCrawler**: Playwright headless Chromium. Expands accordions via JS, strips nav/footer/scripts.
-- **GeminiCleaner**: Sends raw Markdown to Gemini API to produce clean profile documents.
-- **YouTubeChannelScraper**: YouTube Data API v3 for metadata, `YouTubeTranscriptApi` for transcripts. Falls back to Gemini's native video URL feature if transcript is unavailable.
-- **`_file_stage3_gemini()`**: Uploads PDF/Office files to Gemini Files API for extraction with type-specific prompts.
-- **ScraperCache**: Disk cache in `./scraper_cache/` (pages + video summaries). Allows rebuilding the FAISS index with zero API calls.
+Unified content extraction engine for all source types:
+- **WebsiteCrawler**: Playwright headless Chromium crawl with JS execution (expands accordions), strips navigation/footer/scripts, extracts clean Markdown
+- **GeminiCleaner**: Sends raw crawled Markdown to Gemini API for semantic cleaning (removes boilerplate, formats lists/tables)
+- **YouTubeChannelScraper**: YouTube Data API v3 for channel metadata + video list, pulls transcripts via `YouTubeTranscriptApi`, falls back to Gemini's native video URL analysis if transcripts unavailable
+- **File extraction (`_file_stage3_gemini()`)**: Uploads PDF/Word/PowerPoint/Excel to Gemini Files API with type-specific extraction prompts
+- **ScraperCache**: Disk cache at `./scraper_cache/` storing raw pages and video summaries. **Critical feature**: allows rebuilding the entire FAISS index with zero API calls (replay from cache)
 
-### `rag_query.py` — RAG (Claude Tool-Use)
-- Wraps `FAISSDatabase` for retrieval and Anthropic Claude for generation.
-- Claude is given a single tool: `search_portfolio` (calls FAISS hybrid search).
-- Impersonates Bhagwan Chowdhry via a system prompt.
-- Maintains multi-turn chat history via the injected session store.
-- `stream_answer()` yields text tokens; returns `GeminiAnswer` (answer, sources, token count) via `StopIteration.value`.
+### `rag_query.py` — RAG (Claude Tool-Use + Multi-Turn)
+- **Wraps FAISSDatabase + Claude**: Retrieval engine + LLM generation combined.
+- **Tool-based retrieval**: Claude is given a single tool—`search_portfolio`—which calls FAISS hybrid search. Claude decides when/how to search for follow-up context.
+- **Impersonation**: System prompt instructs Claude to embody Dr. Swati Desai's voice (warm, integrative, mindfulness-focused).
+- **Session management**: Multi-turn chat history injected from session store (Firestore/in-memory).
+- **Streaming**: `stream_answer()` is a sync generator yielding tokens in real-time. Returns `GeminiAnswer` dataclass (answer text, sources list, token count) via `StopIteration.value`.
+- **Source tracking**: Each retrieved chunk includes title, section, URL, doc type, relevance score.
 
-### `database.py` — FAISSDatabase
-- **Embedding**: Google Gemini `gemini-embedding-001` (3072-dim). `RETRIEVAL_DOCUMENT` task type for indexing, `RETRIEVAL_QUERY` for search.
-- **Index**: `faiss.IndexFlatIP` + `IndexIDMap` — inner product on L2-normalized vectors = cosine similarity.
-- **Hybrid search**: BM25Okapi (sparse) combined with FAISS (dense). Scores are min-max normalized then blended: **60% dense + 40% sparse**.
-- **Persistence**: `faiss.index` (binary) + `metadata.pkl` (pickled chunk dict).
+### `database.py` — FAISSDatabase (Hybrid Search)
+- **Embedding**: Google Gemini `gemini-embedding-001` (3072-dim). `RETRIEVAL_DOCUMENT` task for indexing, `RETRIEVAL_QUERY` for search queries.
+- **Dense index**: `faiss.IndexFlatIP` with L2-normalized vectors = cosine similarity (semantic search).
+- **Sparse index**: BM25Okapi for keyword-based retrieval.
+- **Hybrid blend**: Retrieves top-k from both indexes, min-max normalizes scores, then combines: **60% dense + 40% sparse** for final ranking.
+- **Persistence**: `faiss.index` (binary FAISS) + `metadata.pkl` (chunk metadata dict).
 
 ### `chunker.py` — DocumentChunker
 - Uses `langchain.RecursiveCharacterTextSplitter` (default chunk_size=3500, overlap=50).
@@ -133,31 +160,70 @@ python delete.py
 ## Ingestion Pipeline Walkthrough
 
 ```
-URL / file / YouTube URL / raw text
-         │
-         ▼
-  server.py  →  one of:
-    POST /ingest             → orchestrator.ingest_portfolio(url)
-    POST /ingest/folder      → orchestrator.ingest_folder(path)
-    POST /ingest/videos      → orchestrator.ingest_videos(urls)
-    POST /ingest/documents   → orchestrator.ingest_raw_documents(docs)
-         │
-         ▼
-  PortfolioScraper (scraper.py)
-    Website? → Playwright crawl → Gemini clean → ScrapedDocument list
-    YouTube? → transcript / Gemini summary → ScrapedDocument list
-    File?    → Gemini Files API / pypdf → ScrapedDocument list
-         │
-         ▼
-  _store_docs (orchestrator.py)
-    1. Corruption guard (binary junk → skip)
-    2. DocumentChunker → DocumentChunk list
-    3. [Optional] embedding dedup (cosine similarity)
-    4. FAISSDatabase.add() — embed + upsert
-    5. remove_short_chunks()
-         │
-         ▼
-  save() + GCS upload
+                     INPUT SOURCES
+         ┌──────────┬──────────┬──────────┐
+         ▼          ▼          ▼          ▼
+      Website   YouTube    Files    Raw Text
+         │          │          │          │
+         └──────────┴──────────┴──────────┘
+                    │
+                    ▼
+  server.py routes (admin-protected):
+    POST /ingest          → crawl portfolio URL(s)
+    POST /ingest/folder   → upload ZIP, PDF, Office files
+    POST /ingest/videos   → YouTube URLs or playlists
+    POST /ingest/documents→ paste raw text directly
+                    │
+                    ▼
+  PortfolioScraper.scrape() — content extraction:
+    Website:  Playwright headless crawl → expand JS → strip nav/footer
+              → Gemini "clean this page" → Markdown
+    YouTube:  Data API v3 metadata → transcript (or Gemini video URL)
+    File:     Gemini Files API → extract text (type-aware: PDF, Word, etc.)
+    Raw text: pass through as-is
+                    │
+                    ▼
+  orchestrator._store_docs() — ingestion pipeline:
+    1. Corruption guard (% control chars > threshold? → skip)
+    2. DocumentChunker.chunk() → 3500-token chunks (50-token overlap)
+    3. [Optional] dedupe by embedding cosine similarity
+    4. Delete old chunks for same URL (upsert semantics)
+    5. FAISSDatabase.add() → embed via Gemini + store in FAISS + BM25
+    6. Remove short chunks (< min_tokens)
+    7. Save to disk + upload to GCS (production)
+                    │
+                    ▼
+             Index updated ✓
+```
+
+---
+
+## Query Pipeline (Chat Flow)
+
+When a user asks a question via `/query/stream` or `/query`:
+
+```
+1. SESSION LOOKUP
+   └─ Retrieve chat history from Firestore/in-memory store
+
+2. HYBRID SEARCH (Claude via tool-use)
+   └─ Query embedded via Gemini API (3072-dim)
+   └─ Search FAISS index (semantic): top-k results
+   └─ Search BM25 index (keyword): top-k results
+   └─ Blend scores (60% dense + 40% sparse)
+   └─ Return top-n chunks with relevance scores
+
+3. CLAUDE GENERATION
+   └─ System prompt: impersonate Dr. Swati
+   └─ Context: last 10 messages (multi-turn history)
+   └─ Retrieved chunks injected into context
+   └─ Claude calls search_portfolio tool if needs more context
+   └─ Generate response with streaming tokens
+
+4. RESPONSE + SOURCES
+   └─ Stream tokens via SSE (Server-Sent Events)
+   └─ Include chunk metadata: title, section, URL, score
+   └─ Save to session store for next turn
 ```
 
 ---
@@ -368,8 +434,22 @@ POST /ingest  { "url": "https://...", "rebuild": true }
 
 ## Key Design Decisions
 
-- **Sync LLM in thread pool**: Anthropic SDK is blocking. Running it in `ThreadPoolExecutor` prevents freezing the asyncio event loop on long queries.
-- **Hybrid search (60/40)**: Combines semantic similarity (dense) with keyword matching (sparse BM25) for better retrieval on specific terms like paper titles and years.
-- **GCS for FAISS**: Cloud Run containers are ephemeral. FAISS index is downloaded from GCS on startup and uploaded after every ingest, so content survives container restarts without redeployment.
-- **Upsert semantics**: Re-ingesting a URL deletes its old chunks first, preventing duplicates.
-- **Skip list**: Manually ingested raw documents are added to the scraper skip list so a portfolio crawl doesn't overwrite them.
+### **Architecture & Performance**
+- **Sync LLM in thread pool**: Anthropic SDK is blocking/synchronous. Running it in `ThreadPoolExecutor` prevents freezing the asyncio event loop on long queries—critical for scaling across concurrent users.
+- **Gunicorn + UvicornWorker (2 workers)**: Parallel request handling; each worker has its own thread pool for LLM calls.
+- **GCS ephemeral persistence**: Cloud Run containers are stateless/ephemeral. FAISS index downloaded on startup, uploaded after each ingest—survives restarts without redeployment.
+
+### **Search & Retrieval**
+- **Hybrid search (60% dense + 40% sparse)**: Combines semantic similarity (Gemini embeddings via FAISS cosine) with keyword matching (BM25Okapi). Handles edge cases: acronyms, titles, years, specific terms that keywords excel at.
+- **Gemini embeddings (3072-dim)**: Higher dimensionality captures nuance; `RETRIEVAL_DOCUMENT` vs `RETRIEVAL_QUERY` task types optimize for indexing vs. search respectively.
+
+### **Data Integrity**
+- **Upsert semantics**: Re-ingesting a URL deletes all old chunks for that URL first, preventing duplicates on update.
+- **Corruption guard**: Binary junk detection (% control characters) prevents polluting index with corrupt PDFs or malformed files.
+- **Scraper cache independence**: Cache (raw pages/videos) is separate from FAISS index—rebuild index with zero API calls by replaying cache.
+- **Skip list**: Manually ingested raw documents are marked so portfolio crawls don't overwrite them.
+
+### **User Experience**
+- **Multi-turn sessions**: Chat history persisted per session ID; Claude sees last 10 messages for context.
+- **Source attribution**: Every response includes chunk provenance (title, section, URL, relevance score).
+- **Tool-based retrieval**: Claude decides *when* and *what* to search via `search_portfolio` tool—enabling follow-up research without user intervention.

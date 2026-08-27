@@ -42,6 +42,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import queue as _sync_queue
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,13 @@ import zipfile
 from orchestrator import RAGOrchestrator
 from rag_query import RAG
 from dotenv import load_dotenv
+
+# Google Drive imports
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
+import io
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -278,6 +286,45 @@ def _set_admin_hash_in_db(hashed_pwd: str) -> None:
     )
 
 
+async def _send_reset_email(reset_url: str) -> None:
+    """
+    Send password reset email via Mailjet.
+    Raises RuntimeError if env vars not configured.
+    """
+    import httpx
+    api_key    = os.environ.get("MAILJET_API_KEY", "")
+    secret_key = os.environ.get("MAILJET_SECRET_KEY", "")
+    from_email = os.environ.get("MAILJET_FROM_EMAIL", "")
+    to_email   = os.environ.get("ADMIN_EMAIL", "")
+    if not all([api_key, secret_key, from_email, to_email]):
+        raise RuntimeError("Mailjet env vars not configured.")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            "https://api.mailjet.com/v3.1/send",
+            auth=(api_key, secret_key),
+            json={
+                "Messages": [{
+                    "From": {"Email": from_email, "Name": "2Meditate Admin"},
+                    "To":   [{"Email": to_email}],
+                    "Subject": "Admin Panel — Password Reset",
+                    "HTMLPart": f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6;">
+  <p>You requested a password reset for the 2Meditate Admin panel.</p>
+  <p><a href="{reset_url}" style="color: #2c5530; font-weight: bold; text-decoration: none; background: #f0f0f0; padding: 10px 20px; display: inline-block; border-radius: 5px;">Reset Your Password</a></p>
+  <p>Or copy and paste this link in your browser:</p>
+  <p><code style="background: #f0f0f0; padding: 10px; display: block; word-break: break-all;">{reset_url}</code></p>
+  <p>This link expires in 10 minutes and can only be used once.</p>
+  <p>If you did not request this, ignore this email.</p>
+</body>
+</html>""",
+                }]
+            },
+        )
+        resp.raise_for_status()
+
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -306,6 +353,150 @@ _rag:            Optional[RAGOrchestrator] = None
 # Model cache: {models: [...], timestamp: ...}
 _model_cache: dict = {"models": None, "timestamp": None}
 _MODEL_CACHE_TTL = 300  # 5 minutes
+
+# Microsoft Graph token cache: {token: ..., timestamp: ...}
+_graph_token_cache: dict = {"token": None, "timestamp": None}
+_GRAPH_TOKEN_CACHE_TTL = 3600  # 1 hour (tokens typically valid for 1 hour)
+
+# Password reset rate limiting: {ip: [timestamp, ...]}
+_pw_reset_rate: dict = {}
+_PW_RESET_MAX_REQUESTS = 3
+_PW_RESET_WINDOW_SECONDS = 600  # 10 minutes
+
+# Google Drive sync configuration
+GDRIVE_SERVICE_ACCOUNT_FILE = os.environ.get('GDRIVE_SERVICE_ACCOUNT_FILE', './service_account.json')
+GDRIVE_FOLDER_ID = os.environ.get('GDRIVE_FOLDER_ID', '')
+GDRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+_gdrive_service_cache = None
+_gdrive_service_cache_time = None
+_GDRIVE_SERVICE_CACHE_TTL = 3600  # 1 hour
+
+
+def _get_microsoft_graph_token() -> str:
+    """
+    Get OAuth2 access token for Microsoft Graph API using client credentials flow.
+    Caches token for 1 hour. Raises HTTPException on failure.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Return cached token if still valid
+    if (_graph_token_cache["token"] is not None and
+        _graph_token_cache["timestamp"] is not None and
+        (now - _graph_token_cache["timestamp"]).total_seconds() < _GRAPH_TOKEN_CACHE_TTL):
+        return _graph_token_cache["token"]
+
+    client_id = os.environ.get("MICROSOFT_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("MICROSOFT_CLIENT_SECRET", "").strip()
+    tenant_id = os.environ.get("MICROSOFT_TENANT_ID", "").strip()
+
+    if not (client_id and client_secret and tenant_id):
+        logger.error("Missing Microsoft OAuth2 credentials: CLIENT_ID=%s, SECRET=%s, TENANT=%s",
+                     bool(client_id), bool(client_secret), bool(tenant_id))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                          detail="OneDrive authentication not configured")
+
+    try:
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+        response = _req.post(token_url, data=payload, timeout=10)
+        response.raise_for_status()
+
+        token_data = response.json()
+        token = token_data.get("access_token")
+        if not token:
+            raise ValueError("No access_token in response")
+
+        # Cache the token
+        _graph_token_cache["token"] = token
+        _graph_token_cache["timestamp"] = now
+        logger.info("Obtained new Microsoft Graph access token")
+
+        return token
+    except Exception as exc:
+        logger.error("Failed to obtain Microsoft Graph token: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                          detail=f"OneDrive authentication failed: {exc}")
+
+
+def _get_gdrive_service():
+    """Initialize authenticated Google Drive service with caching."""
+    global _gdrive_service_cache, _gdrive_service_cache_time
+    now = datetime.now(timezone.utc)
+
+    if (_gdrive_service_cache is not None and
+        _gdrive_service_cache_time is not None and
+        (now - _gdrive_service_cache_time).total_seconds() < _GDRIVE_SERVICE_CACHE_TTL):
+        return _gdrive_service_cache
+
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            GDRIVE_SERVICE_ACCOUNT_FILE,
+            scopes=GDRIVE_SCOPES
+        )
+        service = build('drive', 'v3', credentials=credentials)
+        _gdrive_service_cache = service
+        _gdrive_service_cache_time = now
+        logger.info("Google Drive service initialized and cached")
+        return service
+    except Exception as e:
+        logger.error(f"Failed to initialize Google Drive service: {e}")
+        raise
+
+
+def _get_gdrive_sync_state():
+    """Get last Google Drive sync state from Firestore."""
+    project = os.environ.get('GOOGLE_CLOUD_PROJECT', '')
+    if not project:
+        return None
+
+    try:
+        db_fs = _firestore_client()
+        doc = db_fs.collection('system_config').document('gdrive_sync').get()
+        if doc.exists:
+            return doc.to_dict()
+    except Exception as e:
+        logger.warning(f"Failed to read Google Drive sync state: {e}")
+
+    return None
+
+
+def _save_gdrive_sync_state(last_sync_time: str):
+    """Save Google Drive sync state to Firestore."""
+    project = os.environ.get('GOOGLE_CLOUD_PROJECT', '')
+    if not project:
+        return
+
+    try:
+        db_fs = _firestore_client()
+        db_fs.collection('system_config').document('gdrive_sync').set(
+            {'last_sync_time': last_sync_time},
+            merge=True
+        )
+        logger.info(f"Saved Google Drive sync state: {last_sync_time}")
+    except Exception as e:
+        logger.warning(f"Failed to save Google Drive sync state: {e}")
+
+
+def _download_gdrive_file(drive_service, file_id: str) -> bytes:
+    """Download a file from Google Drive as bytes."""
+    try:
+        request = drive_service.files().get_media(fileId=file_id)
+        file_buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_buffer, request, chunksize=1024*1024)
+
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+
+        return file_buffer.getvalue()
+    except Exception as e:
+        logger.error(f"Failed to download file {file_id}: {e}")
+        raise
 
 
 def _load_model_from_firestore() -> Optional[str]:
@@ -514,6 +705,11 @@ class LoginRequest(BaseModel):
 
 class SetModelRequest(BaseModel):
     model: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 class IngestRequest(BaseModel):
@@ -944,6 +1140,95 @@ def login(body: LoginRequest):
     secret = hashlib.sha256(_cached_admin_hash.encode()).hexdigest()
     payload = {"sub": "admin", "exp": datetime.now(timezone.utc) + timedelta(minutes=30)}
     return {"access_token": jwt.encode(payload, secret, algorithm="HS256"), "token_type": "bearer"}
+
+
+@app.post("/admin/forgot-password")
+async def forgot_password(request: Request):
+    """Generate a password reset token and email it to admin."""
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    if not project:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Not available in local dev mode.")
+
+    frontend_url = os.environ.get("ADMIN_FRONTEND_URL", "").rstrip("/")
+    if not frontend_url:
+        logger.warning("forgot_password: ADMIN_FRONTEND_URL not set")
+        return {"message": "If reset is configured, an email has been sent."}
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = datetime.now(timezone.utc).timestamp()
+
+    global _pw_reset_rate
+    if client_ip in _pw_reset_rate:
+        _pw_reset_rate[client_ip] = [t for t in _pw_reset_rate[client_ip]
+                                      if now - t < _PW_RESET_WINDOW_SECONDS]
+        if len(_pw_reset_rate[client_ip]) >= _PW_RESET_MAX_REQUESTS:
+            return {"message": "If reset is configured, an email has been sent."}
+        _pw_reset_rate[client_ip].append(now)
+    else:
+        _pw_reset_rate[client_ip] = [now]
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    try:
+        db = _firestore_client()
+        db.collection("password_resets").document().set({
+            "token_hash": token_hash,
+            "expires_at": expires_at,
+            "used": False,
+            "created_at": datetime.now(timezone.utc),
+            "ip": client_ip,
+        })
+    except Exception as exc:
+        logger.error("forgot_password: Firestore write failed: %s", exc)
+
+    reset_url = f"{frontend_url}/?token={raw_token}"
+    try:
+        await _send_reset_email(reset_url)
+    except Exception as exc:
+        logger.error("forgot_password: Email send failed: %s", exc)
+
+    return {"message": "If reset is configured, an email has been sent."}
+
+
+@app.post("/admin/reset-password")
+async def reset_password(body: ResetPasswordRequest):
+    """Validate reset token and update admin password."""
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    if not project:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Not available in local dev mode.")
+
+    token_hash = hashlib.sha256(body.token.encode()).hexdigest()
+
+    try:
+        db = _firestore_client()
+        docs = list(db.collection("password_resets")
+                      .where("token_hash", "==", token_hash)
+                      .where("used", "==", False)
+                      .where("expires_at", ">", datetime.now(timezone.utc))
+                      .limit(1).stream())
+
+        if not docs:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired reset token.")
+
+        doc_ref = docs[0].reference
+
+        doc_ref.update({"used": True})
+
+        hashed = password_hasher.hash(body.new_password)
+        _set_admin_hash_in_db(hashed)
+
+        global _cached_admin_hash, _jwt_secret
+        _cached_admin_hash = hashed
+        _jwt_secret = hashlib.sha256(hashed.encode()).hexdigest()
+
+        return {"success": True, "message": "Password updated. Please log in with your new password."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("reset_password: Error: %s", exc)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Reset failed.")
 
 
 @app.get("/admin/firestore/test")
@@ -1377,11 +1662,16 @@ def onedrive_sync():
     if not share_url:
         return {"synced": 0, "warning": "ONEDRIVE_SHARE_URL not set"}
 
+    # Get OAuth2 token for Graph API authentication
+    token = _get_microsoft_graph_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
     encoded = base64.urlsafe_b64encode(("u!" + share_url).encode()).decode().rstrip("=")
     try:
         resp = _req.get(
             f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem/children",
             params={"$select": "id,name,lastModifiedDateTime,file,@microsoft.graph.downloadUrl"},
+            headers=headers,
             timeout=30,
         )
         resp.raise_for_status()
@@ -1417,6 +1707,7 @@ def onedrive_sync():
     rag = _get_rag()
     total_chunks = 0
     synced_names = []
+    max_ingested_time = last_sync_time
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for item in new_files:
@@ -1426,15 +1717,16 @@ def onedrive_sync():
                 continue
             try:
                 # Stream the download just to be safe with memory
-                response = _req.get(download_url, stream=True, timeout=60)
+                response = _req.get(download_url, headers=headers, stream=True, timeout=60)
                 response.raise_for_status()
-                
+
                 dest = os.path.join(tmpdir, item["name"])
                 with open(dest, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                        
+
                 synced_names.append(item["name"])
+                max_ingested_time = item["lastModifiedDateTime"]
                 logger.info("onedrive_sync: downloaded %s", item["name"])
             except Exception as exc:
                 logger.warning("onedrive_sync: failed to download %s: %s", item["name"], exc)
@@ -1446,16 +1738,150 @@ def onedrive_sync():
     if total_chunks > 0:
         _save_and_sync(rag)
 
-    if project:
+    if project and synced_names:
         try:
             db_fs = _firestore_client()
             db_fs.collection("system_config").document("onedrive_sync").set(
-                {"last_sync_time": datetime.now(timezone.utc).isoformat()}, merge=True
+                {"last_sync_time": max_ingested_time}, merge=True
             )
         except Exception as exc:
             logger.warning("onedrive_sync: Firestore write failed: %s", exc)
 
     return {"synced": len(synced_names), "chunks_stored": total_chunks, "files": synced_names}
+
+# ---------------------------------------------------------------------------
+# Google Drive weekly sync (automatic new-file ingestion)
+# ---------------------------------------------------------------------------
+@app.post("/gdrive/sync")
+def gdrive_sync():
+    """
+    List files in the shared Google Drive folder, ingest any added/modified files
+    since the last sync, and update the last_sync_time in Firestore.
+    Called weekly by Cloud Scheduler.
+    """
+    if not GDRIVE_FOLDER_ID:
+        return {"synced": 0, "warning": "GDRIVE_FOLDER_ID not set"}
+
+    try:
+        drive_service = _get_gdrive_service()
+    except Exception as e:
+        logger.error(f"gdrive_sync: Failed to initialize Drive service: {e}")
+        raise HTTPException(status_code=503, detail=f"Google Drive service unavailable: {e}")
+
+    # Get last sync time
+    last_sync_time = None
+    project = os.environ.get('GOOGLE_CLOUD_PROJECT', '')
+
+    if project:
+        sync_state = _get_gdrive_sync_state()
+        if sync_state:
+            last_sync_time = sync_state.get('last_sync_time')
+
+    # Build query for files
+    query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false"
+    if last_sync_time:
+        query += f" and modifiedTime > '{last_sync_time}'"
+
+    # List files (with pagination for folders with >100 files)
+    all_files = []
+    page_token = None
+    try:
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name, mimeType, size, modifiedTime)',
+                pageSize=100,
+                pageToken=page_token,
+                orderBy='modifiedTime desc'
+            ).execute()
+            all_files.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+    except Exception as e:
+        logger.error(f"gdrive_sync: Google Drive API error: {e}")
+        raise HTTPException(status_code=502, detail=f"Google Drive API error: {e}")
+
+    # Filter for supported file types
+    supported_types = [
+        'application/pdf',
+        'text/plain',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'audio/mpeg',
+        'audio/mp4',
+        'application/x-m4a'
+    ]
+
+    new_files = [f for f in all_files if f.get('mimeType') in supported_types]
+
+    if not new_files:
+        return {"synced": 0, "message": "No new supported files since last sync"}
+
+    rag = _get_rag()
+    total_chunks = 0
+    synced_names = []
+    # Initialize max_ingested_time: use current time (no microseconds) if first sync, otherwise use last_sync_time
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat() + 'Z'
+    max_ingested_time = last_sync_time if last_sync_time else now_utc
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for item in new_files:
+            file_id = item['id']
+            file_name = item['name']
+
+            try:
+                # Download file
+                file_bytes = _download_gdrive_file(drive_service, file_id)
+
+                # Save to temp directory
+                dest = os.path.join(tmpdir, file_name)
+                with open(dest, 'wb') as f:
+                    f.write(file_bytes)
+
+                synced_names.append(file_name)
+                max_ingested_time = item['modifiedTime']
+                logger.info(f"gdrive_sync: downloaded {file_name}")
+
+            except Exception as e:
+                logger.warning(f"gdrive_sync: failed to download {file_name}: {e}")
+                continue
+
+        # Ingest files
+        if synced_names:
+            try:
+                total_chunks = rag.ingest_folder(tmpdir, section='gdrive', recursive=False)
+            except Exception as e:
+                logger.error(f"gdrive_sync: Ingestion failed: {e}")
+                return {
+                    "synced": len(synced_names),
+                    "chunks_stored": 0,
+                    "files": synced_names,
+                    "error": f"Ingestion failed: {str(e)}"
+                }
+
+    # Save index and update sync state ONLY if ingestion succeeded
+    if total_chunks > 0:
+        try:
+            _save_and_sync(rag)
+        except Exception as e:
+            logger.error(f"gdrive_sync: Failed to save index to GCS: {e}")
+            return {
+                "synced": len(synced_names),
+                "chunks_stored": total_chunks,
+                "files": synced_names,
+                "error": f"GCS save failed: {str(e)}"
+            }
+        # Only save sync state AFTER successful GCS upload
+        if project:
+            _save_gdrive_sync_state(max_ingested_time)
+
+    return {
+        "synced": len(synced_names),
+        "chunks_stored": total_chunks,
+        "files": synced_names,
+        "next_sync_after": max_ingested_time
+    }
 
 # ---------------------------------------------------------------------------
 # Blog weekly sync  (automatic new-blog ingestion)

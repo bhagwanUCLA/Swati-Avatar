@@ -319,6 +319,12 @@
     margin-top: 8px;
   }
   .login-error { font-size: 13px; color: var(--red); min-height: 20px; margin-bottom: 12px; text-align: left; font-weight: 500; }
+  .forgot-link {
+    display: block; margin-top: 12px; font-size: 12px;
+    color: var(--accent); text-decoration: none; cursor: pointer;
+  }
+  .forgot-link:hover { text-decoration: underline; }
+  .reset-success { color: var(--green); font-size: 13px; margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -333,6 +339,7 @@
            onkeydown="if(event.key==='Enter') doLogin()">
     <div class="login-error" id="login-error"></div>
     <button class="btn btn-primary" onclick="doLogin()">Login</button>
+    <a class="forgot-link" onclick="showForgotPassword()">Forgot password?</a>
   </div>
 
   <div class="login-box" id="setup-box" style="display: none;">
@@ -343,6 +350,33 @@
            onkeydown="if(event.key==='Enter') doSetup()">
     <div class="login-error" id="setup-error"></div>
     <button class="btn btn-primary" onclick="doSetup()">Create Password</button>
+  </div>
+
+  <!-- Forgot password: send email -->
+  <div class="login-box" id="forgot-box" style="display:none;">
+    <h2>Forgot Password</h2>
+    <p class="sub">A reset link will be sent to the configured admin email.</p>
+    <div class="login-error" id="forgot-error"></div>
+    <div id="forgot-success-msg" class="reset-success" style="display:none"></div>
+    <button class="btn btn-primary" id="forgot-send-btn" onclick="doForgotPassword()">Send Reset Link</button>
+    <a class="forgot-link" onclick="showLoginBox()">Back to login</a>
+  </div>
+
+  <!-- Reset password: set new password (shown when ?token= in URL) -->
+  <div class="login-box" id="reset-box" style="display:none;">
+    <h2>Reset Password</h2>
+    <div id="reset-token-form">
+      <label>New Password</label>
+      <input type="password" id="reset-new-password" placeholder="Enter new password"
+             autocomplete="new-password" onkeydown="if(event.key==='Enter') doResetPassword()">
+      <label>Confirm Password</label>
+      <input type="password" id="reset-confirm-password" placeholder="Confirm new password"
+             autocomplete="new-password" onkeydown="if(event.key==='Enter') doResetPassword()">
+      <div class="login-error" id="reset-error"></div>
+      <button class="btn btn-primary" onclick="doResetPassword()">Set New Password</button>
+    </div>
+    <div id="reset-success-msg" class="reset-success" style="display:none"></div>
+    <a class="forgot-link" onclick="showLoginBox()">Back to login</a>
   </div>
 </div>
 
@@ -514,7 +548,7 @@
     <div class="card">
       <div class="card-title">Crawl website</div>
       <label>Root URL</label>
-      <input type="url" id="portfolio-url" placeholder="https://bhagwanchowdhry.com">
+      <input type="url" id="portfolio-url" placeholder="https://swatidesai.com">
       <div class="btn-group">
         <button class="btn btn-primary" onclick="ingestPortfolio()">
           <span id="portfolio-spinner"></span> Start crawl
@@ -672,7 +706,7 @@ copyright \d{4}"></textarea>
 <script>
 // ── Auth & API config ─────────────────────────────────────────────────────
 // Backend URL is hardcoded at deploy time — edit this line before deploying.
-const API = 'https://swati-avatar-578167174494.asia-south1.run.app';   // ← REPLACE with your Cloud Run URL
+const API = 'http://localhost:8000';   // ← LOCAL TESTING (change back before committing)
 
 function getToken() { return sessionStorage.getItem('admin_token') || ''; }
 
@@ -750,6 +784,16 @@ async function doSetup() {
 }
 
 async function initAuth() {
+  // Check for password reset token in URL
+  const urlToken = new URLSearchParams(window.location.search).get('token');
+  if (urlToken) {
+    document.getElementById('login-overlay').style.display = 'flex';
+    ['login-box','setup-box','forgot-box'].forEach(id =>
+      document.getElementById(id).style.display = 'none');
+    document.getElementById('reset-box').style.display = 'block';
+    return;
+  }
+
   // 1. Check status from API
   try {
     const res = await fetch(API + '/admin/setup/status');
@@ -791,8 +835,75 @@ async function initAuth() {
 }
 window.addEventListener('DOMContentLoaded', initAuth);
 
+function showLoginBox() {
+  document.getElementById('login-box').style.display = 'block';
+  document.getElementById('setup-box').style.display = 'none';
+  document.getElementById('forgot-box').style.display = 'none';
+  document.getElementById('reset-box').style.display = 'none';
+}
 
+function showForgotPassword() {
+  document.getElementById('login-box').style.display = 'none';
+  document.getElementById('setup-box').style.display = 'none';
+  document.getElementById('forgot-box').style.display = 'block';
+  document.getElementById('reset-box').style.display = 'none';
+  document.getElementById('forgot-error').textContent = '';
+  document.getElementById('forgot-success-msg').style.display = 'none';
+  document.getElementById('forgot-send-btn').disabled = false;
+  document.getElementById('forgot-send-btn').textContent = 'Send Reset Link';
+}
 
+async function doForgotPassword() {
+  const errEl = document.getElementById('forgot-error');
+  const successEl = document.getElementById('forgot-success-msg');
+  const btn = document.getElementById('forgot-send-btn');
+  errEl.textContent = ''; successEl.style.display = 'none';
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    const res = await fetch(API + '/admin/forgot-password', { method: 'POST' });
+    if (res.status === 501) {
+      errEl.textContent = 'Password reset is not available in local dev mode.';
+      btn.disabled = false; btn.textContent = 'Send Reset Link'; return;
+    }
+    successEl.textContent = 'If a reset email is configured, a link has been sent. Check your inbox.';
+    successEl.style.display = 'block'; btn.textContent = 'Sent';
+  } catch {
+    errEl.textContent = 'Could not connect to server.';
+    btn.disabled = false; btn.textContent = 'Send Reset Link';
+  }
+}
+
+async function doResetPassword() {
+  const newPwd = document.getElementById('reset-new-password').value.trim();
+  const confirmPwd = document.getElementById('reset-confirm-password').value.trim();
+  const errEl = document.getElementById('reset-error');
+  const token = new URLSearchParams(window.location.search).get('token');
+  errEl.textContent = '';
+  if (!newPwd) { errEl.textContent = 'New password is required.'; return; }
+  if (newPwd !== confirmPwd) { errEl.textContent = 'Passwords do not match.'; return; }
+  if (newPwd.length < 8) { errEl.textContent = 'Password must be at least 8 characters.'; return; }
+  if (!token) { errEl.textContent = 'Missing reset token. Use the link from your email.'; return; }
+  errEl.textContent = 'Updating...';
+  try {
+    const res = await fetch(API + '/admin/reset-password', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ token, new_password: newPwd }),
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.detail || 'Reset failed. Link may have expired.'; return; }
+    errEl.textContent = '';
+    document.getElementById('reset-token-form').style.display = 'none';
+    const successEl = document.getElementById('reset-success-msg');
+    successEl.textContent = 'Password updated! Redirecting to login...';
+    successEl.style.display = 'block';
+    setTimeout(() => {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      document.getElementById('reset-token-form').style.display = 'block';
+      successEl.style.display = 'none';
+      showLoginBox();
+    }, 2500);
+  } catch { errEl.textContent = 'Could not connect to server.'; }
+}
 
 function switchTab(event, name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
