@@ -713,11 +713,26 @@ function getToken() { return sessionStorage.getItem('admin_token') || ''; }
 /**
  * Drop-in replacement for fetch() that injects Authorization header.
  * For FormData bodies Content-Type is intentionally NOT set (browser adds boundary).
+ * Automatically handles 401 Unauthorized by redirecting to login.
  */
-function authFetch(url, opts = {}) {
+async function authFetch(url, opts = {}) {
   opts.headers = Object.assign({}, opts.headers);
   opts.headers['Authorization'] = 'Bearer ' + getToken();
-  return fetch(url, opts);
+  const res = await fetch(url, opts);
+
+  // If token is expired/invalid (401), redirect to login
+  if (res.status === 401) {
+    sessionStorage.removeItem('admin_token');
+    document.getElementById('login-token').value = '';
+    document.getElementById('login-error').textContent = 'Session expired. Please log in again.';
+    document.getElementById('login-overlay').style.display = 'flex';
+    document.getElementById('login-box').style.display = 'block';
+    document.getElementById('setup-box').style.display = 'none';
+    document.getElementById('forgot-box').style.display = 'none';
+    document.getElementById('reset-box').style.display = 'none';
+  }
+
+  return res;
 }
 
 async function doLogin() {
@@ -1237,11 +1252,7 @@ async function initModelSelector() {
 
     // Fetch current model
     const currentRes = await authFetch(API + '/admin/config/model');
-    if (currentRes.status === 401) {
-      document.getElementById('modelStatus').textContent = 'Session expired. Please log in again.';
-      document.getElementById('modelStatus').style.color = 'var(--red)';
-      return;
-    }
+    if (currentRes.status === 401) return; // authFetch handles redirect
     if (currentRes.ok) {
       const data = await currentRes.json();
       document.getElementById('currentModel').textContent = data.model;
@@ -1249,11 +1260,7 @@ async function initModelSelector() {
 
     // Fetch available models
     const availRes = await authFetch(API + '/admin/models/available');
-    if (availRes.status === 401) {
-      document.getElementById('modelStatus').textContent = 'Session expired. Please log in again.';
-      document.getElementById('modelStatus').style.color = 'var(--red)';
-      return;
-    }
+    if (availRes.status === 401) return; // authFetch handles redirect
     if (availRes.ok) {
       const data = await availRes.json();
       const dropdown = document.getElementById('modelDropdown');
@@ -1271,7 +1278,6 @@ async function initModelSelector() {
         dropdown.innerHTML = '<option>No models available</option>';
       }
     } else {
-      console.error('Failed to fetch available models:', availRes.status);
       const statusMsg = availRes.status === 503 ? 'Backend service unavailable' : 'Error loading models';
       document.getElementById('modelStatus').textContent = statusMsg;
       document.getElementById('modelStatus').style.color = 'var(--red)';
@@ -1307,9 +1313,7 @@ async function saveModel() {
       body: JSON.stringify({ model })
     });
 
-    if (res.status === 401) {
-      throw new Error('Session expired. Please log in again.');
-    }
+    if (res.status === 401) return; // authFetch handles redirect
 
     if (!res.ok) {
       const error = await res.json();
@@ -1340,6 +1344,9 @@ async function loadIndex() {
     await initModelSelector();
 
     const res = await authFetch(API + '/stats');
+    if (res.status === 401) return; // authFetch handles redirect, stop here
+    if (!res.ok) throw new Error(res.statusText);
+
     const s = await res.json();
     document.getElementById('st-chunks').textContent  = (s.total_chunks   || 0).toLocaleString();
     document.getElementById('st-docs').textContent    = (s.total_documents|| 0).toLocaleString();
@@ -1357,9 +1364,12 @@ async function loadIndex() {
 
     // Load actual document list
     const dres = await authFetch(API + '/documents');
+    if (dres.status === 401) return; // authFetch handles redirect, stop here
+    if (!dres.ok) throw new Error(dres.statusText);
+
     const docs = await dres.json();
     const listEl = document.getElementById('doc-list');
-    
+
     if (!docs.length) {
       listEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted)">Index is empty.</div>';
       return;
@@ -1382,7 +1392,7 @@ async function loadIndex() {
     listEl.innerHTML = html;
 
   } catch(e) {
-    document.getElementById('doc-list').innerHTML = 
+    document.getElementById('doc-list').innerHTML =
       `<div style="color:var(--red);padding:10px">Could not load stats: ${e.message}</div>`;
   }
 }
