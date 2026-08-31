@@ -565,8 +565,6 @@
       <div class="stats-grid">
         <div class="stat-box"><div class="stat-label">Total chunks</div><div class="stat-val" id="st-chunks">—</div></div>
         <div class="stat-box"><div class="stat-label">Total docs</div><div class="stat-val" id="st-docs">—</div></div>
-        <div class="stat-box"><div class="stat-label">Cached pages</div><div class="stat-val" id="st-pages">—</div></div>
-        <div class="stat-box"><div class="stat-label">Cached videos</div><div class="stat-val" id="st-videos">—</div></div>
       </div>
       <div class="section-bar" id="section-bar"></div>
       <hr>
@@ -1350,8 +1348,6 @@ async function loadIndex() {
     const s = await res.json();
     document.getElementById('st-chunks').textContent  = (s.total_chunks   || 0).toLocaleString();
     document.getElementById('st-docs').textContent    = (s.total_documents|| 0).toLocaleString();
-    document.getElementById('st-pages').textContent   = (s.cache?.cached_pages  || 0).toLocaleString();
-    document.getElementById('st-videos').textContent  = (s.cache?.cached_videos || 0).toLocaleString();
 
     const secBar = document.getElementById('section-bar');
     secBar.innerHTML = '';
