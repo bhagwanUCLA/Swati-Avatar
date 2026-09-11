@@ -77,6 +77,7 @@
       height: var(--header-h);
       display: flex;
       align-items: center;
+      justify-content: space-between;
       padding: 0 20px;
       border-bottom: 1px solid var(--border);
       background: var(--header-bg);
@@ -85,6 +86,25 @@
       flex-shrink: 0;
       z-index: 20;
       transition: background var(--transition), border-color var(--transition);
+    }
+
+    .header-link {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: white;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      transition: opacity 0.2s;
+    }
+
+    .header-link:hover {
+      opacity: 0.8;
+    }
+
+    .header-link svg {
+      stroke: white;
     }
 
     .logo {
@@ -496,6 +516,13 @@
     .bio-link:hover { color: var(--amber); }
     .bio-link svg   { opacity: 0.6; }
 
+    .disclaimer {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-weight: 400;
+      text-decoration: underline;
+    }
+
     /* ── Scrollbar ──────────────────────────────────────────────────── */
     ::-webkit-scrollbar       { width: 4px; height: 4px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -601,6 +628,14 @@
       <div class="logo">
         <img src="swathidesai-logo.webp" alt="2meditate logo">
       </div>
+      <a class="header-link" href="https://www.swatidesai.com/" target="_blank" rel="noopener">
+        Visit Website
+        <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/>
+          <polyline points="15 3 21 3 21 9"/>
+          <line x1="10" y1="14" x2="21" y2="3"/>
+        </svg>
+      </a>
     </header>
 
     <!-- ── Main area ─────────────────────────────────────────────── -->
@@ -648,16 +683,9 @@
 
     </div>
 
-    <!-- ── Bio footer ─────────────────────────────────────────────── -->
+    <!-- ── Disclaimer footer ────────────────────────────────────────── -->
     <div id="bio-footer">
-      <a class="bio-link" href="https://www.swatidesai.com/" target="_blank" rel="noopener">
-        2Meditate
-        <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-          <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/>
-          <polyline points="15 3 21 3 21 9"/>
-          <line x1="10" y1="14" x2="21" y2="3"/>
-        </svg>
-      </a>
+      <div class="disclaimer">Responses must be considered as suggestions, not advice</div>
     </div>
 
   </div>
