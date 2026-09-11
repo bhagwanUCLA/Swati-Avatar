@@ -344,7 +344,7 @@ _DEFAULT_CONFIG = {
     "device":            "cpu",
     "model":             "claude-sonnet-4-6",
     "top_k":             6,
-    "gcs_bucket":        os.environ.get("GCS_BUCKET", ""),  # e.g. "bhagwan-rag-store"
+    "gcs_bucket":        os.environ.get("GCS_BUCKET", ""),  # e.g. "swati-rag-index"
 }
 
 _current_config: dict             = dict(_DEFAULT_CONFIG)

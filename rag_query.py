@@ -510,7 +510,7 @@ class RAG:
                 error_body = getattr(exc, "body", {}) or {}
                 error_type = error_body.get("error", {}).get("type", "") if isinstance(error_body, dict) else ""
                 if error_type == "overloaded_error" or getattr(exc, "status_code", 0) == 529 or "overloaded" in msg.lower():
-                    msg = "Bhagwan's AI provider is currently very busy (overloaded). Please wait a moment and try again."
+                    msg = "The AI service is currently very busy (overloaded). Please wait a moment and try again."
                 else:
                     msg = f"AI Provider Error: {msg}"
             

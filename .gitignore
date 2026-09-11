@@ -25,7 +25,7 @@ cache/
 videos/
 outputs/
 links.txt
-
+*.md
 # Misc
 *.log
 .DS_Store
