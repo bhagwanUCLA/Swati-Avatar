@@ -154,6 +154,50 @@ def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
         logger.error("GCS upload failed: %s", exc)
 
 
+def _download_system_prompt_from_gcs(bucket_name: str, config_dir: str) -> bool:
+    """
+    Download system_prompt.txt from GCS into config_dir.
+    Returns True if downloaded successfully.
+    """
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(bucket_name)
+        path = Path(config_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        blob = bucket.blob("system_config/system_prompt.txt")
+        if blob.exists():
+            blob.download_to_filename(str(path / "system_prompt.txt"))
+            logger.info("GCS ↓ downloaded system_prompt.txt")
+            return True
+        else:
+            logger.warning("GCS: system_prompt.txt not found in bucket %s", bucket_name)
+            return False
+    except Exception as exc:
+        logger.error("GCS system prompt download failed: %s", exc)
+        return False
+
+
+def _upload_system_prompt_to_gcs(bucket_name: str, config_dir: str) -> bool:
+    """
+    Upload system_prompt.txt from config_dir to GCS.
+    Returns True if uploaded successfully.
+    """
+    try:
+        client = _gcs_client()
+        bucket = client.bucket(bucket_name)
+        path = Path(config_dir) / "system_prompt.txt"
+        if path.exists():
+            bucket.blob("system_config/system_prompt.txt").upload_from_filename(str(path))
+            logger.info("GCS ↑ uploaded system_prompt.txt")
+            return True
+        else:
+            logger.warning("GCS upload: system_prompt.txt not found locally")
+            return False
+    except Exception as exc:
+        logger.error("GCS system prompt upload failed: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Admin auth dependency
 # ---------------------------------------------------------------------------
@@ -866,6 +910,14 @@ async def startup_event():
         logger.error("Startup: no model configured, falling back to claude-sonnet-4-6")
         _current_config["model"] = "claude-sonnet-4-6"
 
+    # --- 1c. Load System Prompt ---
+    try:
+        from rag_query import load_system_prompt
+        load_system_prompt()
+        logger.info("Startup: system prompt loaded.")
+    except Exception as exc:
+        logger.warning("Startup: failed to load system prompt, using default: %s", exc)
+
     # --- 2. GCS FAISS Download ---
     bucket = _current_config.get("gcs_bucket", "")
     if bucket:
@@ -878,6 +930,17 @@ async def startup_event():
             logger.warning("Startup: GCS download incomplete — starting with empty index.")
     else:
         logger.info("Startup: GCS_BUCKET not set — using local index (local dev mode).")
+
+    # --- 2b. GCS System Prompt Download ---
+    if bucket:
+        logger.info("Startup: downloading system prompt from GCS bucket %s ...", bucket)
+        ok = _download_system_prompt_from_gcs(bucket, "system_config")
+        if not ok:
+            logger.warning("Startup: GCS system prompt download failed — using default.")
+        from rag_query import load_system_prompt
+        load_system_prompt()
+    else:
+        logger.info("Startup: GCS_BUCKET not set — using local system prompt (local dev mode).")
 
     # --- 3. Warm up RAG (load FAISS index + rebuild BM25 before first request) ---
     try:
@@ -1300,6 +1363,45 @@ def set_model(body: SetModelRequest, _: AdminDep):
     return {"success": True, "model": model}
 
 
+@app.get("/admin/system-prompt")
+def get_system_prompt(_: AdminDep):
+    """Get the current system prompt from memory (synced from GCS at startup)."""
+    from rag_query import _SYSTEM_PROMPT
+    return {"prompt": _SYSTEM_PROMPT, "source": "memory (synced from GCS)"}
+
+
+@app.post("/admin/system-prompt")
+def set_system_prompt(body: dict, _: AdminDep):
+    """Update the system prompt and save to disk + GCS."""
+    prompt = body.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    # Save to local file
+    config_dir = Path("system_config")
+    config_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = config_dir / "system_prompt.txt"
+    try:
+        prompt_file.write_text(prompt, encoding='utf-8')
+        logger.info("System prompt saved to %s", prompt_file)
+    except Exception as exc:
+        logger.error("Failed to save system prompt: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to save prompt locally.")
+
+    # Upload to GCS if configured
+    bucket = _current_config.get("gcs_bucket", "")
+    if bucket:
+        ok = _upload_system_prompt_to_gcs(bucket, "system_config")
+        if not ok:
+            logger.warning("Failed to upload system prompt to GCS, but local file saved.")
+
+    # Update in-memory variable
+    from rag_query import load_system_prompt
+    load_system_prompt()
+    logger.info("Admin updated system prompt")
+    return {"success": True, "message": "System prompt updated and saved."}
+
+
 # ---------------------------------------------------------------------------
 # Admin routes  (Bearer token required)
 # ---------------------------------------------------------------------------
@@ -1359,21 +1461,40 @@ def ingest(body: IngestRequest, _: AdminDep):
 def list_documents(_: AdminDep):
     """Returns a list of unique documents currently indexed."""
     db = _get_rag().db
-    docs = {}
+    rag = _get_rag()
+    docs_by_index = {}
+
+    # Group chunks by doc_index and get metadata
     for c in db._meta.values():
-        title = c.doc_title
-        if title not in docs:
-            docs[title] = {
-                "title":    title,
+        if c.doc_index not in docs_by_index:
+            docs_by_index[c.doc_index] = {
+                "title":    c.doc_title,
+                "doc_index": c.doc_index,
                 "section":  c.section,
                 "url":      c.doc_url,
                 "doc_type": c.doc_type,
                 "chunks":   0,
             }
-        docs[title]["chunks"] += 1
-    result = list(docs.values())
+        docs_by_index[c.doc_index]["chunks"] += 1
+
+    result = list(docs_by_index.values())
     result.sort(key=lambda x: x["title"].lower())
     return result
+
+
+@app.get("/documents/{doc_index}/chunks")
+def get_document_chunks(doc_index: int, _: AdminDep):
+    """Return full document content by concatenating all chunks in order."""
+    chunks = _get_rag().query_doc(doc_index)
+    if not chunks:
+        raise HTTPException(status_code=404, detail="No chunks found for this doc_index.")
+    # Concatenate all raw_content in chunk_index order
+    content = '\n\n---\n\n'.join(c.raw_content for c in chunks)
+    return {
+        "doc_index": doc_index,
+        "chunk_count": len(chunks),
+        "content": content,
+    }
 
 
 @app.delete("/documents/{doc_title:path}")

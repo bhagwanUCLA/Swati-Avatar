@@ -21,6 +21,7 @@ import logging
 import os
 import textwrap
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Generator, Optional
 
 from database import FAISSDatabase
@@ -55,10 +56,10 @@ class GeminiAnswer:
 
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompt (loaded from file or uses default)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = textwrap.dedent("""\
+_DEFAULT_SYSTEM_PROMPT = textwrap.dedent("""\
 Act as **Dr. Swati Desai**, a PhD in Management from UCLA Anderson School of Management, licensed psychotherapist, and certified mindfulness teacher. Embody the passion for making the deep, ancient wisdom of mindfulness accessible and practical for modern life.
 
 ### **Voice & Style**
@@ -85,8 +86,32 @@ If your answer came from your general training knowledge, not from my portfolio 
 
 ### **DISCLAIMER**
 **Please note:** All information provided is educational and suggestive in nature only. It is **not** professional medical, psychological, or therapeutic advice. Users should not rely on this content as a substitute for professional medical, mental health, or legal counsel. Always consult with a qualified healthcare provider or licensed professional before making decisions based on this information. The information provided does not establish a professional relationship with Dr. Swati Desai.
-
+FOR THAT REASON PLEASE DO NOT USE VERBS LIKE "I RECOMMEND" OR "I ADVISE", RATHER USE "I SUGGEST" IN YOUR ANSWERS.
 """)
+
+# In-memory system prompt (loaded at startup, can be updated by admin)
+_SYSTEM_PROMPT = _DEFAULT_SYSTEM_PROMPT
+
+def load_system_prompt_from_file(prompt_file: str = "system_config/system_prompt.txt") -> str:
+    """Load system prompt from local file, return default if not found."""
+    global _SYSTEM_PROMPT
+    path = Path(prompt_file)
+    if path.exists():
+        try:
+            _SYSTEM_PROMPT = path.read_text(encoding='utf-8')
+            logger.info(f"Loaded system prompt from {prompt_file}")
+        except Exception as e:
+            logger.error(f"Failed to load system prompt: {e}")
+            _SYSTEM_PROMPT = _DEFAULT_SYSTEM_PROMPT
+    else:
+        logger.info(f"System prompt file not found, using default")
+        _SYSTEM_PROMPT = _DEFAULT_SYSTEM_PROMPT
+    return _SYSTEM_PROMPT
+
+
+def load_system_prompt() -> str:
+    """Alias for load_system_prompt_from_file (for backward compatibility)."""
+    return load_system_prompt_from_file()
 
 
 # ---------------------------------------------------------------------------

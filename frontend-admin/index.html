@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RAG Admin — Portfolio</title>
+<title>Swati Admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -168,6 +168,27 @@
   .doc-table .btn-del:hover { background: var(--red-bg); }
   .doc-title-link { color: var(--blue); text-decoration: none; font-weight: 500; }
   .doc-title-link:hover { text-decoration: underline; }
+  .btn-del { color: var(--red); text-decoration: none; cursor: pointer; font-weight: 600; }
+  .btn-del:hover { text-decoration: underline; }
+
+  /* ── Document Accordion ── */
+  .doc-accordion { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .doc-card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+  .doc-card-header {
+    padding: 10px 14px; cursor: pointer; display: flex; align-items: center;
+    gap: 10px; user-select: none; transition: background 0.12s;
+  }
+  .doc-card-header:hover { background: var(--bg3); }
+  .doc-card-meta { flex: 1; min-width: 0; }
+  .doc-card-title { font-size: 13px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .doc-card-sub { font-size: 11px; color: var(--muted); margin-top: 2px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .doc-card-body { display: none; padding: 14px 16px; border-top: 1px solid var(--border); background: var(--bg); }
+  .doc-card-body.open { display: block; }
+  .doc-card-chevron { color: var(--muted); transition: transform 0.2s; flex-shrink: 0; }
+  .doc-card-chevron.open { transform: rotate(180deg); }
+  .doc-chunk { padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 8px; font-size: 11px; color: var(--muted); font-family: var(--mono); white-space: pre-wrap; line-height: 1.5; background: var(--surface); }
+  .doc-chunk-label { font-size: 10px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+  .doc-card-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
   /* ── Chat history ── */
   .chat-session-card {
@@ -414,12 +435,12 @@
   </div>
 
   <div class="tabs">
-    <button class="tab active" onclick="switchTab(event, 'index')">Index</button>
+    <button class="tab active" onclick="switchTab(event, 'prompt')">Prompt</button>
     <button class="tab" onclick="switchTab(event, 'chats')">Chats</button>
+    <button class="tab" onclick="switchTab(event, 'index')">Knowledge Base</button>
     <button class="tab" onclick="switchTab(event, 'documents')">Paste Documents</button>
     <button class="tab" onclick="switchTab(event, 'folder')">File / Zip</button>
     <button class="tab" onclick="switchTab(event, 'videos')">Videos</button>
-    <button class="tab" onclick="switchTab(event, 'portfolio')">URL</button>
     <button class="tab" onclick="switchTab(event, 'cleanup')">Cleanup</button>
   </div>
 
@@ -543,38 +564,17 @@
     </div>
   </div>
 
-  <!-- ── PORTFOLIO URL ── -->
-  <div id="panel-portfolio" class="panel">
+  <!-- ── SYSTEM PROMPT ── -->
+  <div id="panel-prompt" class="panel active">
     <div class="card">
-      <div class="card-title">Crawl website</div>
-      <label>Root URL</label>
-      <input type="url" id="portfolio-url" placeholder="https://swatidesai.com">
-      <div class="btn-group">
-        <button class="btn btn-primary" onclick="ingestPortfolio()">
-          <span id="portfolio-spinner"></span> Start crawl
-        </button>
+      <div class="card-title">System Prompt</div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit the system prompt that defines the avatar's personality and behavior.</p>
+      <textarea id="prompt-text" style="width:100%;height:400px;padding:10px;border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:11px;resize:vertical"></textarea>
+      <div class="btn-group" style="margin-top:12px">
+        <button class="btn" onclick="loadSystemPrompt()">↺ Reload</button>
+        <button class="btn" onclick="saveSystemPrompt()" style="background:var(--green-bg);color:var(--green)">💾 Save</button>
       </div>
-      <div id="portfolio-toast" class="toast"></div>
-    </div>
-  </div>
-
-  <!-- ── INDEX ── -->
-  <div id="panel-index" class="panel active">
-    <div class="card">
-      <div class="card-title">Index stats</div>
-      <div class="stats-grid">
-        <div class="stat-box"><div class="stat-label">Total chunks</div><div class="stat-val" id="st-chunks">—</div></div>
-        <div class="stat-box"><div class="stat-label">Total docs</div><div class="stat-val" id="st-docs">—</div></div>
-      </div>
-      <div class="section-bar" id="section-bar"></div>
-      <hr>
-      <div class="card-title">Documents in index</div>
-      <div id="doc-list" style="max-height:400px;overflow-y:auto;font-size:12px;color:var(--muted)"></div>
-    </div>
-    <div class="btn-group">
-    </div>
-    <div class="btn-group">
-      <button class="btn" onclick="loadIndex()">↺ Refresh</button>
+      <div id="prompt-status" style="margin-top:12px;font-size:12px;color:var(--muted)"></div>
     </div>
   </div>
 
@@ -591,6 +591,26 @@
         <button class="btn" id="load-more-btn" style="display:none" onclick="loadMoreChats()">Load more</button>
         <button class="btn" onclick="refreshChats()">↺ Refresh</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ── INDEX ── -->
+  <div id="panel-index" class="panel">
+    <div class="card">
+      <div class="card-title">Knowledge Base stats</div>
+      <div class="stats-grid">
+        <div class="stat-box"><div class="stat-label">Total docs</div><div class="stat-val" id="st-docs">—</div></div>
+        <div class="stat-box"><div class="stat-label">Total chunks</div><div class="stat-val" id="st-chunks">—</div></div>
+      </div>
+      <div class="section-bar" id="section-bar"></div>
+      <hr>
+      <div class="card-title">Documents</div>
+      <div id="doc-list" style="max-height:400px;overflow-y:auto;font-size:12px;color:var(--muted)"></div>
+    </div>
+    <div class="btn-group">
+    </div>
+    <div class="btn-group">
+      <button class="btn" onclick="loadIndex()">↺ Refresh</button>
     </div>
   </div>
 
@@ -701,6 +721,7 @@ copyright \d{4}"></textarea>
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 // ── Auth & API config ─────────────────────────────────────────────────────
 // Backend URL is hardcoded at deploy time — edit this line before deploying.
@@ -925,6 +946,7 @@ function switchTab(event, name) {
   document.getElementById('panel-' + name).classList.add('active');
   if (name === 'index') loadIndex();
   if (name === 'chats') loadChats();
+  if (name === 'prompt') onPromptTabOpen();
 }
 
 function showToast(id, msg, type) {
@@ -1045,26 +1067,6 @@ async function ingestVideos() {
 }
 
 // ── PORTFOLIO URL ─────────────────────────────────────────────────────────
-async function ingestPortfolio() {
-  const url = document.getElementById('portfolio-url').value.trim();
-  if (!url) return showToast('portfolio-toast', 'URL is required.', 'err');
-  spin('portfolio-spinner', true);
-  showToast('portfolio-toast', 'Crawling… this can take several minutes.', 'info');
-  try {
-    const res = await authFetch(API + '/ingest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, rebuild: false })
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || res.statusText);
-    showToast('portfolio-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
-  } catch(e) {
-    showToast('portfolio-toast', '✕ ' + e.message, 'err');
-  }
-  spin('portfolio-spinner', false);
-}
-
 // ── CHATS ─────────────────────────────────────────────────────────────────
 const CHAT_PAGE = 20;
 let _chatOffset = 0;
@@ -1371,21 +1373,74 @@ async function loadIndex() {
       return;
     }
 
-    let html = '<table class="doc-table"><thead><tr><th>Title</th><th>Section</th><th>Type</th><th>Chunks</th><th class="actions"></th></tr></thead><tbody>';
-    docs.forEach(d => {
-      const link = d.url ? `<a href="${d.url}" target="_blank" class="doc-title-link">${esc(d.title)}</a>` : esc(d.title);
-      html += `<tr>
-        <td>${link}</td>
-        <td><span class="sec-pill" style="cursor:default">${esc(d.section)}</span></td>
-        <td style="color:var(--muted)">${esc(d.doc_type)}</td>
-        <td>${d.chunks}</td>
-        <td class="actions">
-          <button class="btn-del" onclick="deleteDocument('${esc(d.title)}')">Delete</button>
-        </td>
-      </tr>`;
+    let html = '<div class="doc-accordion">';
+    docs.forEach((d, i) => {
+      const cardId  = `doc-card-body-${i}`;
+      const chevId  = `doc-chevron-${i}`;
+      // Build source HTML: blue link for web/YouTube, plain filename for file:// uploads
+      let sourceHtml = '—';
+      if (d.url) {
+        try {
+          const urlObj = new URL(d.url);
+          if (urlObj.protocol === 'file:') {
+            // Local file upload — extract and decode filename
+            const rawName = urlObj.pathname.split('/').pop() || d.url;
+            const decodedName = decodeURIComponent(rawName);
+            sourceHtml = `<span style="font-family:var(--mono)">${esc(decodedName)}</span>`;
+          } else {
+            // Web or YouTube URL — show as blue clickable link
+            const label = urlObj.hostname + (urlObj.pathname !== '/' ? urlObj.pathname : '');
+            sourceHtml = `<a href="${d.url}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-family:var(--mono)" title="${esc(d.url)}">${esc(label)}</a>`;
+          }
+        } catch { sourceHtml = esc(d.url); }
+      }
+      html += `
+        <div class="doc-card">
+          <div class="doc-card-header" data-doc-index="${d.doc_index}" data-card-id="${cardId}" data-chev-id="${chevId}">
+            <div class="doc-card-meta">
+              <div class="doc-card-title"><strong>${esc(d.title)}</strong></div>
+              <div class="doc-card-sub">
+                <span class="sec-pill" style="cursor:default">${esc(d.section)}</span>
+                <span>${esc(d.doc_type)}</span>
+                ${sourceHtml}
+                <span>${d.chunks} chunk${d.chunks !== 1 ? 's' : ''}</span>
+              </div>
+            </div>
+            <div class="doc-card-actions">
+              <a href="#" class="btn-del" data-delete-title="${esc(d.title).replace(/"/g,'&quot;')}">Delete</a>
+            </div>
+            <svg id="${chevId}" class="doc-card-chevron" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </div>
+          <div class="doc-card-body" id="${cardId}">
+            <div style="color:var(--muted);font-size:12px">Loading chunks…</div>
+          </div>
+        </div>`;
     });
-    html += '</tbody></table>';
+    html += '</div>';
     listEl.innerHTML = html;
+
+    // Event delegation on the accordion container
+    listEl.addEventListener('click', async (e) => {
+      // Delete button
+      const delBtn = e.target.closest('[data-delete-title]');
+      if (delBtn) {
+        const title = delBtn.getAttribute('data-delete-title');
+        await deleteDocument(title);
+        return;
+      }
+      // Header click → toggle accordion
+      const header = e.target.closest('.doc-card-header');
+      if (!header) return;
+      const bodyEl = document.getElementById(header.dataset.cardId);
+      const chevEl = document.getElementById(header.dataset.chevId);
+      const isOpen = bodyEl.classList.toggle('open');
+      chevEl.classList.toggle('open', isOpen);
+      if (isOpen && bodyEl.dataset.loaded !== 'true') {
+        await loadDocumentChunks(parseInt(header.dataset.docIndex), bodyEl);
+      }
+    });
 
   } catch(e) {
     document.getElementById('doc-list').innerHTML =
@@ -1395,18 +1450,87 @@ async function loadIndex() {
 
 async function deleteDocument(title) {
   if (!confirm(`Are you sure you want to delete "${title}"? This will remove all associated chunks and cache entries.`)) return;
-  
+
   try {
     // Use encodeURIComponent because titles can have special characters/slashes
     const res = await authFetch(API + '/documents/' + encodeURIComponent(title), { method: 'DELETE' });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Delete failed');
-    
+
     // Refresh the list
     loadIndex();
   } catch(e) {
     alert('Error: ' + e.message);
   }
+}
+
+async function loadDocumentChunks(docIndex, containerEl) {
+  try {
+    const res = await authFetch(`${API}/documents/${docIndex}/chunks`);
+    if (res.status === 401) return;
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+
+    // Render markdown using marked (assumes marked.js is loaded globally)
+    let html = '';
+    if (typeof marked !== 'undefined') {
+      html = `<div style="font-size:12px;line-height:1.7;color:var(--text)">${marked.parse(data.content)}</div>`;
+    } else {
+      // Fallback if marked not available
+      html = `<pre style="font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--muted);white-space:pre-wrap;overflow:auto">${esc(data.content)}</pre>`;
+    }
+    containerEl.innerHTML = html || '<div style="color:var(--muted);font-size:12px">No content found.</div>';
+    containerEl.dataset.loaded = 'true';
+  } catch(e) {
+    containerEl.innerHTML = `<div style="color:var(--red);font-size:12px">Failed to load chunks: ${esc(e.message)}</div>`;
+  }
+}
+
+// ── SYSTEM PROMPT ────────────────────────────────────────────────────────
+async function loadSystemPrompt() {
+  try {
+    const res = await authFetch(`${API}/admin/system-prompt`);
+    if (res.status === 401) return;
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+    document.getElementById('prompt-text').value = data.prompt;
+    document.getElementById('prompt-status').textContent = 'Prompt loaded.';
+  } catch(e) {
+    document.getElementById('prompt-status').textContent = `Error: ${e.message}`;
+    document.getElementById('prompt-status').style.color = 'var(--red)';
+  }
+}
+
+async function saveSystemPrompt() {
+  const prompt = document.getElementById('prompt-text').value.trim();
+  if (!prompt) {
+    alert('Prompt cannot be empty.');
+    return;
+  }
+
+  try {
+    const res = await authFetch(`${API}/admin/system-prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt })
+    });
+    if (res.status === 401) return;
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+    document.getElementById('prompt-status').textContent = 'Saved successfully!';
+    document.getElementById('prompt-status').style.color = 'var(--green)';
+    setTimeout(() => {
+      document.getElementById('prompt-status').textContent = '';
+    }, 3000);
+  } catch(e) {
+    document.getElementById('prompt-status').textContent = `Error: ${e.message}`;
+    document.getElementById('prompt-status').style.color = 'var(--red)';
+  }
+}
+
+// Call loadSystemPrompt when prompt tab is opened
+function onPromptTabOpen() {
+  loadSystemPrompt();
 }
 
 // ── CLEANUP ──────────────────────────────────────────────────────────────
@@ -1527,6 +1651,11 @@ async function cleanupApply() {
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', () => {
+  loadSystemPrompt();
+});
 
 </script>
 </body>
