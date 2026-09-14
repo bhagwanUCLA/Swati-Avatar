@@ -375,16 +375,22 @@ class FAISSDatabase:
     def stats(self) -> dict:
         sections: dict[str, int] = {}
         titles:   set[str]       = set()
+        docs_by_section: dict[str, set] = {}
         for c in self._meta.values():
             sections[c.section] = sections.get(c.section, 0) + 1
             titles.add(c.doc_title)
+            if c.section not in docs_by_section:
+                docs_by_section[c.section] = set()
+            docs_by_section[c.section].add(c.doc_title)
+
+        section_docs = {sec: len(docs) for sec, docs in docs_by_section.items()}
         return {
-            "total_chunks":    len(self._meta),
-            "total_documents": len(titles),
-            "sections":        sections,
-            "embedding_dim":   self._dim,
-            "model":           self.model_name,
-            "bm25_indexed":    self._bm25 is not None,
+            "total_chunks":      len(self._meta),
+            "total_documents":   len(titles),
+            "sections":          section_docs,
+            "embedding_dim":     self._dim,
+            "model":             self.model_name,
+            "bm25_indexed":      self._bm25 is not None,
         }
 
     # -------------------------------------------------------------------------
