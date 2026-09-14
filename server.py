@@ -1901,7 +1901,7 @@ def gdrive_sync():
     # Build query for files
     query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false"
     if last_sync_time:
-        query += f" and modifiedTime > '{last_sync_time}'"
+        query += f" and createdTime > '{last_sync_time}'"
 
     # List files (with pagination for folders with >100 files)
     all_files = []
@@ -1911,10 +1911,10 @@ def gdrive_sync():
             results = drive_service.files().list(
                 q=query,
                 spaces='drive',
-                fields='files(id, name, mimeType, size, modifiedTime)',
+                fields='files(id, name, mimeType, size, createdTime)',
                 pageSize=100,
                 pageToken=page_token,
-                orderBy='modifiedTime desc'
+                orderBy='createdTime desc'
             ).execute()
             all_files.extend(results.get('files', []))
             page_token = results.get('nextPageToken')
@@ -1961,7 +1961,7 @@ def gdrive_sync():
                     f.write(file_bytes)
 
                 synced_names.append(file_name)
-                max_ingested_time = item['modifiedTime']
+                max_ingested_time = item['createdTime']
                 logger.info(f"gdrive_sync: downloaded {file_name}")
 
             except Exception as e:
