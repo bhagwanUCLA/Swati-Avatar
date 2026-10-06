@@ -565,7 +565,7 @@
   </div>
 
   <!-- ── SYSTEM PROMPT ── -->
-  <div id="panel-prompt" class="panel active">
+  <div id="panel-prompt" class="panel">
     <div class="card">
       <div class="card-title">System Prompt</div>
       <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit the system prompt that defines the avatar's personality and behavior.</p>
@@ -1530,7 +1530,7 @@ async function saveSystemPrompt() {
 
 // Call loadSystemPrompt when prompt tab is opened
 function onPromptTabOpen() {
-  loadSystemPrompt();
+  if (getToken()) loadSystemPrompt();
 }
 
 // ── CLEANUP ──────────────────────────────────────────────────────────────

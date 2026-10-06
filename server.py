@@ -212,7 +212,7 @@ def require_admin(
     FastAPI dependency that enforces Bearer token auth on admin routes.
     Verifies the JWT obtained from POST /login.
     """
-    global _cached_admin_hash, _jwt_secret
+    global _cached_admin_hash
 
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     if not project:
@@ -234,8 +234,8 @@ def require_admin(
             detail="Admin password is not configured. Please complete setup.",
         )
 
-    if not _jwt_secret:
-        _jwt_secret = hashlib.sha256(_cached_admin_hash.encode()).hexdigest()
+    # Always recalculate secret from current hash (don't cache) to avoid multi-worker issues
+    jwt_secret = hashlib.sha256(_cached_admin_hash.encode()).hexdigest()
 
     if creds is None:
         raise HTTPException(
@@ -244,7 +244,7 @@ def require_admin(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        jwt.decode(creds.credentials, _jwt_secret, algorithms=["HS256"])
+        jwt.decode(creds.credentials, jwt_secret, algorithms=["HS256"])
     except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1282,9 +1282,9 @@ async def reset_password(body: ResetPasswordRequest):
         hashed = password_hasher.hash(body.new_password)
         _set_admin_hash_in_db(hashed)
 
-        global _cached_admin_hash, _jwt_secret
+        global _cached_admin_hash
         _cached_admin_hash = hashed
-        _jwt_secret = hashlib.sha256(hashed.encode()).hexdigest()
+        # Note: _jwt_secret is no longer cached; it's recalculated on each request to avoid multi-worker issues
 
         return {"success": True, "message": "Password updated. Please log in with your new password."}
     except HTTPException:
