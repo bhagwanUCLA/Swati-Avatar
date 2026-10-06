@@ -1654,7 +1654,10 @@ function esc(s) {
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', () => {
-  loadSystemPrompt();
+  // Only load system prompt if user is already authenticated
+  if (getToken()) {
+    loadSystemPrompt();
+  }
 });
 
 </script>
