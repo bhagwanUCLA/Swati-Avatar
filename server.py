@@ -466,7 +466,7 @@ _SYNC_ITEM_STATUSES = {
     _SYNC_ITEM_FAILED,
 }
 _SYNC_PROCESSING_LEASE_SECONDS = 900
-_SYNC_MAX_ATTEMPTS = 3
+_SYNC_MAX_ATTEMPTS = 2
 _SYNC_RETRY_BASE_SECONDS = 30
 _SYNC_RETRY_MAX_SECONDS = 900
 _SYNC_WORKER_POLL_SECONDS = 15
@@ -1009,6 +1009,51 @@ def _restart_sync_job(job_id: str) -> dict:
     }, merge=True)
     _wake_sync_worker()
     return _sync_job_status(job_id)
+
+
+def _remove_gdrive_video_items(job_id: str) -> dict:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job_doc = job_ref.get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    job = job_doc.to_dict() or {}
+    if job.get("source") != "gdrive":
+        raise HTTPException(status_code=400, detail="Video removal is only available for Google Drive jobs.")
+
+    items = list(job_ref.collection("items").stream())
+    processing_items = [
+        item_doc.id
+        for item_doc in items
+        if (item_doc.to_dict() or {}).get("status") == _SYNC_ITEM_PROCESSING
+    ]
+    if processing_items:
+        raise HTTPException(
+            status_code=409,
+            detail="Wait for the active item to finish before removing videos.",
+        )
+
+    batch = db_fs.batch()
+    removed = 0
+    for item_doc in items:
+        item = item_doc.to_dict() or {}
+        mime_type = str((item.get("metadata") or {}).get("mime_type") or "")
+        if not mime_type.startswith("video/"):
+            continue
+        batch.delete(item_doc.reference)
+        batch.delete(_sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        ))
+        removed += 1
+
+    if removed:
+        batch.commit()
+        _refresh_sync_job_status(job_id)
+
+    result = _sync_job_status(job_id)
+    result["removed_video_items"] = removed
+    return result
 
 
 def _refresh_sync_job_status(job_id: str) -> None:
@@ -2347,6 +2392,12 @@ def restart_sync_job(job_id: str, _: AdminDep):
     return _restart_sync_job(job_id)
 
 
+@app.post("/sync-jobs/{job_id}/remove-videos")
+def remove_sync_job_videos(job_id: str, _: AdminDep):
+    """Remove non-processing video items from a Google Drive sync job."""
+    return _remove_gdrive_video_items(job_id)
+
+
 # ---------------------------------------------------------------------------
 # Additional ingest endpoints  (admin)
 # ---------------------------------------------------------------------------
@@ -2724,7 +2775,10 @@ def gdrive_sync():
     from orchestrator import _ALL_SUPPORTED
     new_files = [
         item for item in all_files
-        if Path(item.get('name', '')).suffix.lower() in _ALL_SUPPORTED
+        if (
+            Path(item.get('name', '')).suffix.lower() in _ALL_SUPPORTED
+            and item.get('mimeType', '').startswith('audio/')
+        )
     ]
 
     if not new_files:
