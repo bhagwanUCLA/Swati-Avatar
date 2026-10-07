@@ -107,8 +107,6 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 # ---------------------------------------------------------------------------
 
 _GCS_INDEX_FILES = ["faiss.index", "metadata.pkl"]
-_GCS_INDEX_PREFIX = "rag_index"
-_GCS_INDEX_MANIFEST = f"{_GCS_INDEX_PREFIX}/current.json"
 
 
 def _gcs_client():
@@ -128,24 +126,12 @@ def _download_index_from_gcs(bucket_name: str, index_dir: str) -> bool:
         path    = Path(index_dir)
         path.mkdir(parents=True, exist_ok=True)
 
-        manifest_blob = bucket.blob(_GCS_INDEX_MANIFEST)
-        if manifest_blob.exists():
-            manifest = json.loads(manifest_blob.download_as_text())
-            release_id = manifest.get("release_id")
-            files = manifest.get("files")
-            if not release_id or files != _GCS_INDEX_FILES:
-                raise ValueError("GCS index manifest is missing a valid release ID or file list.")
-            blob_paths = [f"{_GCS_INDEX_PREFIX}/releases/{release_id}/{fname}" for fname in _GCS_INDEX_FILES]
-        else:
-            logger.info("GCS: no index manifest found; loading legacy index files.")
-            blob_paths = [f"{_GCS_INDEX_PREFIX}/{fname}" for fname in _GCS_INDEX_FILES]
-
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_path = Path(tmpdir)
-            for fname, blob_path in zip(_GCS_INDEX_FILES, blob_paths):
-                blob = bucket.blob(blob_path)
+            for fname in _GCS_INDEX_FILES:
+                blob = bucket.blob(f"rag_index/{fname}")
                 if not blob.exists():
-                    logger.warning("GCS: %s not found in bucket %s", blob_path, bucket_name)
+                    logger.warning("GCS: rag_index/%s not found in bucket %s", fname, bucket_name)
                     return False
                 blob.download_to_filename(str(temp_path / fname))
 
@@ -160,8 +146,8 @@ def _download_index_from_gcs(bucket_name: str, index_dir: str) -> bool:
 
 def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
     """
-    Upload a consistent FAISS index release and publish it with a manifest.
-    Raises when either index file or the manifest cannot be persisted.
+    Upload faiss.index + metadata.pkl to the legacy GCS index paths.
+    Raises when either file cannot be persisted.
     """
     path = Path(index_dir)
     missing_files = [fname for fname in _GCS_INDEX_FILES if not (path / fname).is_file()]
@@ -170,25 +156,12 @@ def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
 
     client = _gcs_client()
     bucket = client.bucket(bucket_name)
-    release_id = uuid.uuid4().hex
-    release_prefix = f"{_GCS_INDEX_PREFIX}/releases/{release_id}"
-
     try:
         for fname in _GCS_INDEX_FILES:
-            bucket.blob(f"{release_prefix}/{fname}").upload_from_filename(str(path / fname))
-            logger.info("GCS ↑ uploaded %s for index release %s", fname, release_id)
-
-        manifest = {
-            "release_id": release_id,
-            "files": _GCS_INDEX_FILES,
-            "published_at": _sync_timestamp(),
-        }
-        bucket.blob(_GCS_INDEX_MANIFEST).upload_from_string(
-            json.dumps(manifest), content_type="application/json"
-        )
-        logger.info("GCS ↑ published index release %s", release_id)
+            bucket.blob(f"rag_index/{fname}").upload_from_filename(str(path / fname))
+            logger.info("GCS ↑ uploaded %s", fname)
     except Exception as exc:
-        logger.error("GCS upload failed for index release %s: %s", release_id, exc)
+        logger.error("GCS upload failed: %s", exc)
         raise RuntimeError(f"GCS index upload failed: {exc}") from exc
 
 
@@ -431,6 +404,8 @@ _DEFAULT_CONFIG = {
 
 _current_config: dict             = dict(_DEFAULT_CONFIG)
 _rag:            Optional[RAGOrchestrator] = None
+_index_storage_ready = True
+_index_storage_error: Optional[str] = None
 
 # Model cache: {models: [...], timestamp: ...}
 _model_cache: dict = {"models": None, "timestamp": None}
@@ -1140,6 +1115,7 @@ def _claim_next_sync_work() -> Optional[tuple[str, dict]]:
 
 
 def _run_index_mutation(operation):
+    _ensure_index_storage_ready()
     with _index_write_lock:
         return operation()
 
@@ -1148,6 +1124,7 @@ def _serialized_index_mutation(handler):
     if inspect.iscoroutinefunction(handler):
         @functools.wraps(handler)
         async def async_wrapped(*args, **kwargs):
+            _ensure_index_storage_ready()
             with _index_write_lock:
                 return await handler(*args, **kwargs)
         return async_wrapped
@@ -1329,6 +1306,9 @@ def _start_sync_worker() -> None:
     global _sync_worker_task, _sync_worker_wakeup
     if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
         return
+    if not _index_storage_ready:
+        logger.error("Sync worker not started: %s", _index_storage_error)
+        return
     if _sync_worker_task is not None and not _sync_worker_task.done():
         return
     _sync_worker_wakeup = asyncio.Event()
@@ -1496,10 +1476,19 @@ def _get_gemini_rag(
 
 def _save_and_sync(rag: RAGOrchestrator) -> None:
     """Save index to disk then push to GCS (if GCS_BUCKET is configured)."""
+    _ensure_index_storage_ready()
     rag.save()
     bucket = _current_config.get("gcs_bucket", "")
     if bucket:
         _upload_index_to_gcs(bucket, _current_config["index_dir"])
+
+
+def _ensure_index_storage_ready() -> None:
+    if not _index_storage_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_index_storage_error or "The persisted index is unavailable; writes are blocked.",
+        )
 
 
 def _scan_cleanup_candidates(db, req: CleanupRequest) -> tuple[list[int], list[dict]]:
@@ -1727,7 +1716,7 @@ async def startup_event():
     2. Load model selection from Firestore.
     3. Download the FAISS index from GCS (if configured).
     """
-    global _cached_admin_hash, _current_config
+    global _cached_admin_hash, _current_config, _index_storage_ready, _index_storage_error
 
     # --- 1. Password Setup ---
     try:
@@ -1773,10 +1762,19 @@ async def startup_event():
         logger.info("Startup: downloading FAISS index from GCS bucket %s ...", bucket)
         ok = _download_index_from_gcs(bucket, index_dir)
         if ok:
+            _index_storage_ready = True
+            _index_storage_error = None
             logger.info("Startup: FAISS index ready from GCS.")
         else:
-            logger.warning("Startup: GCS download incomplete — starting with empty index.")
+            _index_storage_ready = False
+            _index_storage_error = (
+                "The persisted FAISS index could not be loaded from GCS; "
+                "index writes and sync processing are blocked to protect existing data."
+            )
+            logger.error("Startup: %s", _index_storage_error)
     else:
+        _index_storage_ready = True
+        _index_storage_error = None
         logger.info("Startup: GCS_BUCKET not set — using local index (local dev mode).")
 
     # --- 2b. GCS System Prompt Download ---
@@ -1790,21 +1788,22 @@ async def startup_event():
     else:
         logger.info("Startup: GCS_BUCKET not set — using local system prompt (local dev mode).")
 
-    # --- 3. Warm up RAG (load FAISS index + rebuild BM25 before first request) ---
-    try:
-        _get_rag()
-        logger.info("Startup: RAG index loaded and ready.")
-    except Exception as exc:
-        logger.error("Startup: RAG warm-up failed — first query will trigger lazy load. Error: %s", exc)
+    if _index_storage_ready:
+        # --- 3. Warm up RAG (load FAISS index + rebuild BM25 before first request) ---
+        try:
+            _get_rag()
+            logger.info("Startup: RAG index loaded and ready.")
+        except Exception as exc:
+            logger.error("Startup: RAG warm-up failed — first query will trigger lazy load. Error: %s", exc)
 
-    try:
-        recovered = await asyncio.to_thread(_recover_empty_index_failures)
-        if recovered:
-            logger.warning("Startup: requeued %d item(s) after empty-index recovery.", recovered)
-    except Exception as exc:
-        logger.error("Startup: empty-index recovery failed: %s", exc)
+        try:
+            recovered = await asyncio.to_thread(_recover_empty_index_failures)
+            if recovered:
+                logger.warning("Startup: requeued %d item(s) after empty-index recovery.", recovered)
+        except Exception as exc:
+            logger.error("Startup: empty-index recovery failed: %s", exc)
 
-    _start_sync_worker()
+        _start_sync_worker()
 
 
 @app.on_event("shutdown")
