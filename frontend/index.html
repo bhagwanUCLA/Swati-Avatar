@@ -319,7 +319,7 @@
       font-size: 14px;
       line-height: 1.65;
       color: var(--text);
-      white-space: pre-wrap;
+      white-space: normal;
       word-break: break-word;
     }
 
@@ -369,10 +369,10 @@
       40%           { opacity: 1;   transform: scale(1.2); }
     }
 
-    .bubble-text p            { margin-top: 0; margin-bottom: 0.1em; }
+    .bubble-text p            { margin-top: 0; margin-bottom: 8px; }
     .bubble-text p:last-child { margin-bottom: 0; }
     .bubble-text ul,
-    .bubble-text ol           { padding-left: 20px; margin-bottom: 0.3em; }
+    .bubble-text ol           { padding-left: 20px; margin-bottom: 8px; }
     .bubble-text code         { font-size: 12px; background: var(--bg3); padding: 1px 5px; border-radius: 4px; }
     .bubble-text pre          { background: var(--bg3); padding: 10px 12px; border-radius: var(--radius-sm); overflow-x: auto; margin-bottom: 0.3em; }
     .bubble-text pre code     { background: none; padding: 0; }
@@ -713,6 +713,7 @@
         year: 'numeric', month: 'long', day: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
+      const exportTitle = 'Conversation with Dr Swati Desai';
 
       // Build turn HTML for the print window
       let turnsHtml = '';
@@ -745,7 +746,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<title>Conversation with Dr. Swati Desai</title>
+<title>${exportTitle}</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -894,6 +895,7 @@ ${turnsHtml}
       }
       win.document.write(printHtml);
       win.document.close();
+      win.document.title = exportTitle;
 
       // Wait for KaTeX stylesheet to load, then print
       win.addEventListener('load', () => {

@@ -76,7 +76,7 @@
 
   .tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
   .tab {
-    padding: 10px 18px; font-size: 13px; font-weight: 500; cursor: pointer;
+    padding: 10px 18px; font-size: 13px; font-weight: 700; cursor: pointer;
     border: none; background: transparent; color: var(--muted);
     border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color 0.12s;
   }
@@ -310,6 +310,30 @@
     padding: 6px 0 2px;
   }
 
+  /* ── Sync jobs ── */
+  .sync-job-card { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); margin-bottom: 12px; }
+  .sync-job-header { padding: 12px 14px; background: var(--bg3); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .sync-job-title { font-size: 13px; font-weight: 700; color: var(--text); }
+  .sync-job-meta { font-size: 11px; color: var(--muted); }
+  .sync-job-counts { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .sync-job-count { padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .sync-job-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); }
+  .sync-job-items { border-top: 1px solid var(--border); max-height: 360px; overflow-y: auto; }
+  .sync-job-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 8px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .sync-job-item:last-child { border-bottom: none; }
+  .sync-job-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sync-status { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .sync-status.pending { color: var(--blue); }
+  .sync-status.processing { color: var(--accent); }
+  .sync-status.completed { color: var(--green); }
+  .sync-status.failed { color: var(--red); }
+  .sync-job-error { grid-column: 1 / -1; color: var(--red); font-family: var(--mono); font-size: 10px; white-space: pre-wrap; word-break: break-word; }
+  @media (max-width: 600px) {
+    .sync-job-counts { margin-left: 0; width: 100%; }
+    .sync-job-item { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .sync-job-item .btn { grid-column: 1 / -1; justify-self: start; }
+  }
+
   /* ── Login overlay ── */
   #login-overlay {
     display: flex; position: fixed; inset: 0;
@@ -435,8 +459,9 @@
   </div>
 
   <div class="tabs">
-    <button class="tab active" onclick="switchTab(event, 'prompt')">Prompt</button>
+    <button class="tab" onclick="switchTab(event, 'prompt')">Prompt</button>
     <button class="tab" onclick="switchTab(event, 'chats')">Chats</button>
+    <button class="tab" onclick="switchTab(event, 'jobs')">Sync Jobs</button>
     <button class="tab" onclick="switchTab(event, 'index')">Knowledge Base</button>
     <button class="tab" onclick="switchTab(event, 'documents')">Paste Documents</button>
     <button class="tab" onclick="switchTab(event, 'folder')">File / Zip</button>
@@ -591,6 +616,19 @@
         <button class="btn" id="load-more-btn" style="display:none" onclick="loadMoreChats()">Load more</button>
         <button class="btn" onclick="refreshChats()">↺ Refresh</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ── SYNC JOBS ── -->
+  <div id="panel-jobs" class="panel">
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
+        <div class="card-title" style="margin:0">Background Sync Jobs</div>
+        <button class="btn btn-sm" onclick="loadSyncJobs()">↺ Refresh</button>
+      </div>
+      <p class="hint">Refreshes every 10 seconds while this tab is open. Remove only skips queued or failed items; completed files remain indexed.</p>
+      <div id="sync-jobs-status" class="chats-status" style="display:none"></div>
+      <div id="sync-jobs-list"></div>
     </div>
   </div>
 
@@ -772,19 +810,23 @@ async function doLogin() {
     sessionStorage.setItem('admin_token', data.access_token);
     errEl.textContent = '';
     document.getElementById('login-overlay').style.display = 'none';
-    onPromptTabOpen();
+    initModelSelector();
   } catch(e) {
     errEl.textContent = 'Could not connect to server.';
   }
 }
 
 function doLogout() {
+  stopSyncJobsRefresh();
   sessionStorage.removeItem('admin_token');
   document.getElementById('login-token').value = '';
   document.getElementById('login-error').textContent = '';
   document.getElementById('login-overlay').style.display = 'flex';
   document.getElementById('login-box').style.display = 'block';
   document.getElementById('setup-box').style.display = 'none';
+  document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(panel => panel.classList.remove('active'));
+  document.getElementById('modelSelector').style.display = 'none';
 }
 
 async function doSetup() {
@@ -811,7 +853,7 @@ async function doSetup() {
     const loginData = await loginRes.json();
     sessionStorage.setItem('admin_token', loginData.access_token);
     document.getElementById('login-overlay').style.display = 'none';
-    onPromptTabOpen();
+    initModelSelector();
   } catch (err) {
     errEl.textContent = err.message;
   }
@@ -841,7 +883,7 @@ async function initAuth() {
       // Local dev bypass
       if (data.bypass) {
         document.getElementById('login-overlay').style.display = 'none';
-        onPromptTabOpen();
+        initModelSelector();
         return;
       }
 
@@ -864,7 +906,7 @@ async function initAuth() {
     document.getElementById('setup-box').style.display = 'none';
   } else {
     document.getElementById('login-overlay').style.display = 'none';
-    onPromptTabOpen();
+    initModelSelector();
   }
 }
 window.addEventListener('DOMContentLoaded', initAuth);
@@ -944,6 +986,8 @@ function switchTab(event, name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   if (event && event.currentTarget) event.currentTarget.classList.add('active');
   document.getElementById('panel-' + name).classList.add('active');
+  if (name === 'jobs') startSyncJobsRefresh();
+  else stopSyncJobsRefresh();
   if (name === 'index') loadIndex();
   if (name === 'chats') loadChats();
   if (name === 'prompt') onPromptTabOpen();
@@ -1244,6 +1288,125 @@ function simpleMd(text) {
     .replace(/\n/g, '<br>');
 }
 
+// ── SYNC JOBS ───────────────────────────────────────────────────────────
+const SYNC_JOBS_REFRESH_MS = 10_000;
+let syncJobsRefreshTimer = null;
+let syncJobsLoading = false;
+
+function startSyncJobsRefresh() {
+  stopSyncJobsRefresh();
+  loadSyncJobs();
+  syncJobsRefreshTimer = setInterval(loadSyncJobs, SYNC_JOBS_REFRESH_MS);
+}
+
+function stopSyncJobsRefresh() {
+  if (syncJobsRefreshTimer) clearInterval(syncJobsRefreshTimer);
+  syncJobsRefreshTimer = null;
+}
+
+async function loadSyncJobs() {
+  if (syncJobsLoading || !getToken()) return;
+  syncJobsLoading = true;
+  const listEl = document.getElementById('sync-jobs-list');
+  const statusEl = document.getElementById('sync-jobs-status');
+
+  try {
+    const response = await authFetch(`${API}/sync-jobs`);
+    if (!response.ok) throw new Error(await syncJobError(response));
+    const data = await response.json();
+    const jobs = data.jobs || [];
+    const details = await Promise.all(jobs.map(async job => {
+      const detailResponse = await authFetch(`${API}/sync-jobs/${encodeURIComponent(job.id)}?item_limit=500`);
+      if (!detailResponse.ok) throw new Error(await syncJobError(detailResponse));
+      return detailResponse.json();
+    }));
+
+    listEl.innerHTML = details.length
+      ? details.map(renderSyncJob).join('')
+      : '<div style="padding:20px;text-align:center;color:var(--muted)">No sync jobs yet.</div>';
+    statusEl.style.display = 'none';
+  } catch (error) {
+    statusEl.textContent = `Failed to load sync jobs: ${error.message}`;
+    statusEl.style.color = 'var(--red)';
+    statusEl.style.display = 'block';
+  } finally {
+    syncJobsLoading = false;
+  }
+}
+
+function renderSyncJob(job) {
+  const counts = job.counts || {};
+  const countHtml = ['pending', 'processing', 'completed', 'failed']
+    .map(status => `<span class="sync-job-count">${status}: ${counts[status] || 0}</span>`)
+    .join('');
+  const itemsHtml = (job.items || []).map(item => {
+    const canRemove = item.status === 'pending' || item.status === 'failed';
+    return `
+      <div class="sync-job-item">
+        <span class="sync-job-item-name">${esc(item.name || item.source_id)}</span>
+        <span class="sync-status ${esc(item.status)}">${esc(item.status)}</span>
+        <span>${item.attempts || 0} attempt${item.attempts === 1 ? '' : 's'}</span>
+        ${canRemove ? `<button class="btn btn-sm" onclick="removeSyncJobItem('${job.id}', '${item.id}')">Remove</button>` : ''}
+        ${item.error ? `<div class="sync-job-error">${esc(item.error)}</div>` : ''}
+      </div>`;
+  }).join('');
+  const canRestart = job.status === 'paused';
+  const canPause = job.status !== 'completed';
+
+  return `
+    <section class="sync-job-card">
+      <div class="sync-job-header">
+        <div>
+          <div class="sync-job-title">${esc(job.source || 'sync')} · ${esc(job.status || 'unknown')}</div>
+          <div class="sync-job-meta">Started ${esc(job.created_at || 'unknown')}</div>
+        </div>
+        <div class="sync-job-counts">${countHtml}</div>
+      </div>
+      <div class="sync-job-actions">
+        ${canPause ? `<button class="btn btn-sm" onclick="runSyncJobAction('${job.id}', 'pause')">Pause & reset unfinished</button>` : ''}
+        ${canRestart ? `<button class="btn btn-sm btn-primary" onclick="runSyncJobAction('${job.id}', 'restart')">Restart</button>` : ''}
+        ${job.source === 'gdrive' ? `<button class="btn btn-sm" onclick="runSyncJobAction('${job.id}', 'remove-videos')">Remove non-processing videos</button>` : ''}
+      </div>
+      <div class="sync-job-items">${itemsHtml || '<div style="padding:12px;color:var(--muted);font-size:12px">No queued items.</div>'}</div>
+    </section>`;
+}
+
+async function syncJobError(response) {
+  const data = await response.json().catch(() => ({}));
+  return data.detail || response.statusText || `HTTP ${response.status}`;
+}
+
+async function runSyncJobAction(jobId, action) {
+  const labels = {
+    pause: 'Pause this job and reset every unfinished item to pending?',
+    restart: 'Restart this paused job?',
+    'remove-videos': 'Remove all non-processing video items from this Drive job?',
+  };
+  if (!confirm(labels[action])) return;
+
+  try {
+    const response = await authFetch(`${API}/sync-jobs/${encodeURIComponent(jobId)}/${action}`, { method: 'POST' });
+    if (!response.ok) throw new Error(await syncJobError(response));
+    await loadSyncJobs();
+  } catch (error) {
+    alert(`Sync job action failed: ${error.message}`);
+  }
+}
+
+async function removeSyncJobItem(jobId, itemId) {
+  if (!confirm('Remove this pending or failed item without processing it?')) return;
+  try {
+    const response = await authFetch(
+      `${API}/sync-jobs/${encodeURIComponent(jobId)}/items/${encodeURIComponent(itemId)}`,
+      { method: 'DELETE' },
+    );
+    if (!response.ok) throw new Error(await syncJobError(response));
+    await loadSyncJobs();
+  } catch (error) {
+    alert(`Could not remove item: ${error.message}`);
+  }
+}
+
 // ── MODEL SELECTOR ────────────────────────────────────────────────────────
 async function initModelSelector() {
   try {
@@ -1340,9 +1503,6 @@ async function saveModel() {
 // ── INDEX ─────────────────────────────────────────────────────────────────
 async function loadIndex() {
   try {
-    // Initialize model selector
-    await initModelSelector();
-
     const res = await authFetch(API + '/stats');
     if (res.status === 401) return; // authFetch handles redirect, stop here
     if (!res.ok) throw new Error(res.statusText);
@@ -1651,14 +1811,6 @@ async function cleanupApply() {
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
-
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', () => {
-  // Only load system prompt if user is already authenticated
-  if (getToken()) {
-    loadSystemPrompt();
-  }
-});
 
 </script>
 </body>

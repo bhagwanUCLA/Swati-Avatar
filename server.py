@@ -1056,6 +1056,43 @@ def _remove_gdrive_video_items(job_id: str) -> dict:
     return result
 
 
+def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job_doc = job_ref.get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    item_ref = job_ref.collection("items").document(item_id)
+    item_doc = item_ref.get()
+    if not item_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job item not found.")
+
+    item = item_doc.to_dict() or {}
+    if item.get("status") == _SYNC_ITEM_PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail="A processing item cannot be removed. Pause the job and wait for it to stop first.",
+        )
+    if item.get("status") == _SYNC_ITEM_COMPLETED:
+        raise HTTPException(
+            status_code=409,
+            detail="Completed items are already indexed and cannot be removed from the queue.",
+        )
+
+    batch = db_fs.batch()
+    batch.delete(item_ref)
+    batch.delete(_sync_source_item_reference(
+        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+    ))
+    batch.commit()
+    _refresh_sync_job_status(job_id)
+
+    result = _sync_job_status(job_id)
+    result["removed_item"] = {"id": item_id, "name": item.get("name")}
+    return result
+
+
 def _refresh_sync_job_status(job_id: str) -> None:
     job_ref = _sync_jobs_client().collection(_SYNC_JOBS_COLLECTION).document(job_id)
     job = job_ref.get().to_dict() or {}
@@ -2396,6 +2433,12 @@ def restart_sync_job(job_id: str, _: AdminDep):
 def remove_sync_job_videos(job_id: str, _: AdminDep):
     """Remove non-processing video items from a Google Drive sync job."""
     return _remove_gdrive_video_items(job_id)
+
+
+@app.delete("/sync-jobs/{job_id}/items/{item_id}")
+def remove_sync_job_item(job_id: str, item_id: str, _: AdminDep):
+    """Remove a pending or failed item from a sync job without indexing it."""
+    return _remove_sync_job_item(job_id, item_id)
 
 
 # ---------------------------------------------------------------------------
