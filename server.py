@@ -478,10 +478,17 @@ def _get_gdrive_service():
         return _gdrive_service_cache
 
     try:
-        credentials = service_account.Credentials.from_service_account_file(
-            GDRIVE_SERVICE_ACCOUNT_FILE,
-            scopes=GDRIVE_SCOPES
-        )
+        service_account_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT", "").strip()
+        if service_account_json:
+            credentials = service_account.Credentials.from_service_account_info(
+                json.loads(service_account_json),
+                scopes=GDRIVE_SCOPES,
+            )
+        else:
+            credentials = service_account.Credentials.from_service_account_file(
+                GDRIVE_SERVICE_ACCOUNT_FILE,
+                scopes=GDRIVE_SCOPES,
+            )
         service = build('drive', 'v3', credentials=credentials)
         _gdrive_service_cache = service
         _gdrive_service_cache_time = now
