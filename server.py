@@ -24,7 +24,7 @@ event_stream() coroutine polls that queue with short sleeps, keeping the
 event loop free for other requests and heartbeat keepalives.
 
 Gunicorn start command (Cloud Run):
-  gunicorn -k uvicorn.workers.UvicornWorker server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+  gunicorn -k uvicorn.workers.UvicornWorker server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
 
 Session persistence
 -------------------
@@ -37,13 +37,18 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
+import functools
 import hashlib
+import inspect
 import hmac
 import json
 import logging
 import os
 import secrets
 import queue as _sync_queue
+import threading
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import requests as _req
@@ -101,6 +106,8 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 # ---------------------------------------------------------------------------
 
 _GCS_INDEX_FILES = ["faiss.index", "metadata.pkl"]
+_GCS_INDEX_PREFIX = "rag_index"
+_GCS_INDEX_MANIFEST = f"{_GCS_INDEX_PREFIX}/current.json"
 
 
 def _gcs_client():
@@ -119,16 +126,32 @@ def _download_index_from_gcs(bucket_name: str, index_dir: str) -> bool:
         bucket  = client.bucket(bucket_name)
         path    = Path(index_dir)
         path.mkdir(parents=True, exist_ok=True)
-        found   = 0
-        for fname in _GCS_INDEX_FILES:
-            blob = bucket.blob(f"rag_index/{fname}")
-            if blob.exists():
-                blob.download_to_filename(str(path / fname))
+
+        manifest_blob = bucket.blob(_GCS_INDEX_MANIFEST)
+        if manifest_blob.exists():
+            manifest = json.loads(manifest_blob.download_as_text())
+            release_id = manifest.get("release_id")
+            files = manifest.get("files")
+            if not release_id or files != _GCS_INDEX_FILES:
+                raise ValueError("GCS index manifest is missing a valid release ID or file list.")
+            blob_paths = [f"{_GCS_INDEX_PREFIX}/releases/{release_id}/{fname}" for fname in _GCS_INDEX_FILES]
+        else:
+            logger.info("GCS: no index manifest found; loading legacy index files.")
+            blob_paths = [f"{_GCS_INDEX_PREFIX}/{fname}" for fname in _GCS_INDEX_FILES]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir)
+            for fname, blob_path in zip(_GCS_INDEX_FILES, blob_paths):
+                blob = bucket.blob(blob_path)
+                if not blob.exists():
+                    logger.warning("GCS: %s not found in bucket %s", blob_path, bucket_name)
+                    return False
+                blob.download_to_filename(str(temp_path / fname))
+
+            for fname in _GCS_INDEX_FILES:
+                os.replace(temp_path / fname, path / fname)
                 logger.info("GCS ↓ downloaded %s", fname)
-                found += 1
-            else:
-                logger.warning("GCS: %s not found in bucket %s", fname, bucket_name)
-        return found == len(_GCS_INDEX_FILES)
+        return True
     except Exception as exc:
         logger.error("GCS download failed: %s", exc)
         return False
@@ -136,22 +159,36 @@ def _download_index_from_gcs(bucket_name: str, index_dir: str) -> bool:
 
 def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
     """
-    Upload faiss.index + metadata.pkl from index_dir to GCS.
-    Called after every rag.save() so the index survives container restarts.
+    Upload a consistent FAISS index release and publish it with a manifest.
+    Raises when either index file or the manifest cannot be persisted.
     """
+    path = Path(index_dir)
+    missing_files = [fname for fname in _GCS_INDEX_FILES if not (path / fname).is_file()]
+    if missing_files:
+        raise FileNotFoundError(f"Cannot upload incomplete FAISS index: {', '.join(missing_files)}")
+
+    client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    release_id = uuid.uuid4().hex
+    release_prefix = f"{_GCS_INDEX_PREFIX}/releases/{release_id}"
+
     try:
-        client = _gcs_client()
-        bucket = client.bucket(bucket_name)
-        path   = Path(index_dir)
         for fname in _GCS_INDEX_FILES:
-            local = path / fname
-            if local.exists():
-                bucket.blob(f"rag_index/{fname}").upload_from_filename(str(local))
-                logger.info("GCS ↑ uploaded %s", fname)
-            else:
-                logger.warning("GCS upload: %s not found locally", fname)
+            bucket.blob(f"{release_prefix}/{fname}").upload_from_filename(str(path / fname))
+            logger.info("GCS ↑ uploaded %s for index release %s", fname, release_id)
+
+        manifest = {
+            "release_id": release_id,
+            "files": _GCS_INDEX_FILES,
+            "published_at": _sync_timestamp(),
+        }
+        bucket.blob(_GCS_INDEX_MANIFEST).upload_from_string(
+            json.dumps(manifest), content_type="application/json"
+        )
+        logger.info("GCS ↑ published index release %s", release_id)
     except Exception as exc:
-        logger.error("GCS upload failed: %s", exc)
+        logger.error("GCS upload failed for index release %s: %s", release_id, exc)
+        raise RuntimeError(f"GCS index upload failed: {exc}") from exc
 
 
 def _download_system_prompt_from_gcs(bucket_name: str, config_dir: str) -> bool:
@@ -398,10 +435,6 @@ _rag:            Optional[RAGOrchestrator] = None
 _model_cache: dict = {"models": None, "timestamp": None}
 _MODEL_CACHE_TTL = 300  # 5 minutes
 
-# Microsoft Graph token cache: {token: ..., timestamp: ...}
-_graph_token_cache: dict = {"token": None, "timestamp": None}
-_GRAPH_TOKEN_CACHE_TTL = 3600  # 1 hour (tokens typically valid for 1 hour)
-
 # Password reset rate limiting: {ip: [timestamp, ...]}
 _pw_reset_rate: dict = {}
 _PW_RESET_MAX_REQUESTS = 3
@@ -416,55 +449,28 @@ _gdrive_service_cache_time = None
 _GDRIVE_SERVICE_CACHE_TTL = 3600  # 1 hour
 
 
-def _get_microsoft_graph_token() -> str:
-    """
-    Get OAuth2 access token for Microsoft Graph API using client credentials flow.
-    Caches token for 1 hour. Raises HTTPException on failure.
-    """
-    now = datetime.now(timezone.utc)
-
-    # Return cached token if still valid
-    if (_graph_token_cache["token"] is not None and
-        _graph_token_cache["timestamp"] is not None and
-        (now - _graph_token_cache["timestamp"]).total_seconds() < _GRAPH_TOKEN_CACHE_TTL):
-        return _graph_token_cache["token"]
-
-    client_id = os.environ.get("MICROSOFT_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("MICROSOFT_CLIENT_SECRET", "").strip()
-    tenant_id = os.environ.get("MICROSOFT_TENANT_ID", "").strip()
-
-    if not (client_id and client_secret and tenant_id):
-        logger.error("Missing Microsoft OAuth2 credentials: CLIENT_ID=%s, SECRET=%s, TENANT=%s",
-                     bool(client_id), bool(client_secret), bool(tenant_id))
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                          detail="OneDrive authentication not configured")
-
-    try:
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://graph.microsoft.com/.default",
-        }
-        response = _req.post(token_url, data=payload, timeout=10)
-        response.raise_for_status()
-
-        token_data = response.json()
-        token = token_data.get("access_token")
-        if not token:
-            raise ValueError("No access_token in response")
-
-        # Cache the token
-        _graph_token_cache["token"] = token
-        _graph_token_cache["timestamp"] = now
-        logger.info("Obtained new Microsoft Graph access token")
-
-        return token
-    except Exception as exc:
-        logger.error("Failed to obtain Microsoft Graph token: %s", exc)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                          detail=f"OneDrive authentication failed: {exc}")
+_SYNC_JOBS_COLLECTION = "sync_jobs"
+_SYNC_SOURCE_ITEMS_COLLECTION = "sync_source_items"
+_YOUTUBE_SUBSCRIPTIONS_COLLECTION = "youtube_subscriptions"
+_SYNC_JOB_SOURCES = {"gdrive", "blogs", "youtube"}
+_SYNC_ITEM_PENDING = "pending"
+_SYNC_ITEM_PROCESSING = "processing"
+_SYNC_ITEM_COMPLETED = "completed"
+_SYNC_ITEM_FAILED = "failed"
+_SYNC_ITEM_STATUSES = {
+    _SYNC_ITEM_PENDING,
+    _SYNC_ITEM_PROCESSING,
+    _SYNC_ITEM_COMPLETED,
+    _SYNC_ITEM_FAILED,
+}
+_SYNC_PROCESSING_LEASE_SECONDS = 900
+_SYNC_MAX_ATTEMPTS = 3
+_SYNC_RETRY_BASE_SECONDS = 30
+_SYNC_RETRY_MAX_SECONDS = 900
+_SYNC_WORKER_POLL_SECONDS = 15
+_sync_worker_task: Optional[asyncio.Task] = None
+_sync_worker_wakeup: Optional[asyncio.Event] = None
+_index_write_lock = threading.RLock()
 
 
 def _get_gdrive_service():
@@ -522,15 +528,12 @@ def _save_gdrive_sync_state(last_sync_time: str):
     if not project:
         return
 
-    try:
-        db_fs = _firestore_client()
-        db_fs.collection('system_config').document('gdrive_sync').set(
-            {'last_sync_time': last_sync_time},
-            merge=True
-        )
-        logger.info(f"Saved Google Drive sync state: {last_sync_time}")
-    except Exception as e:
-        logger.warning(f"Failed to save Google Drive sync state: {e}")
+    db_fs = _firestore_client()
+    db_fs.collection('system_config').document('gdrive_sync').set(
+        {'last_sync_time': last_sync_time},
+        merge=True
+    )
+    logger.info(f"Saved Google Drive sync state: {last_sync_time}")
 
 
 def _download_gdrive_file(drive_service, file_id: str) -> bytes:
@@ -548,6 +551,547 @@ def _download_gdrive_file(drive_service, file_id: str) -> bytes:
     except Exception as e:
         logger.error(f"Failed to download file {file_id}: {e}")
         raise
+
+
+def _download_gdrive_file_to_path(drive_service, file_id: str, destination: Path) -> None:
+    try:
+        request = drive_service.files().get_media(fileId=file_id)
+        with open(destination, "wb") as file_handle:
+            downloader = MediaIoBaseDownload(file_handle, request, chunksize=1024 * 1024)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+    except Exception as exc:
+        logger.error("Failed to download Google Drive file %s: %s", file_id, exc)
+        raise
+
+
+def _sync_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sync_jobs_client():
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Sync jobs require Firestore in production mode.",
+        )
+    return _firestore_client()
+
+
+def _sync_source_url(source: str, source_id: str) -> str:
+    if source == "gdrive":
+        return f"gdrive://{source_id}"
+    if source == "blogs":
+        return f"cms://blog/{source_id}"
+    if source == "youtube":
+        return f"https://www.youtube.com/watch?v={source_id}"
+    raise ValueError(f"Unsupported sync source: {source}")
+
+
+def _sync_item_document_id(source: str, source_id: str) -> str:
+    digest = hashlib.sha256(f"{source}:{source_id}".encode()).hexdigest()
+    return f"{source}-{digest}"
+
+
+def _sync_source_item_reference(
+    db_fs,
+    source: str,
+    source_id: str,
+    dedupe_key: Optional[str] = None,
+):
+    return db_fs.collection(_SYNC_SOURCE_ITEMS_COLLECTION).document(
+        _sync_item_document_id(source, dedupe_key or source_id)
+    )
+
+
+def _parse_sync_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _create_sync_job(
+    source: str,
+    discovered_after: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> str:
+    if source not in _SYNC_JOB_SOURCES:
+        raise ValueError(f"Unsupported sync source: {source}")
+
+    job_id = uuid.uuid4().hex
+    now = _sync_timestamp()
+    _sync_jobs_client().collection(_SYNC_JOBS_COLLECTION).document(job_id).set({
+        "source": source,
+        "status": "discovering",
+        "discovered_after": discovered_after,
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+        "metadata": metadata or {},
+    })
+    return job_id
+
+
+def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
+    if source not in _SYNC_JOB_SOURCES:
+        raise ValueError(f"Unsupported sync source: {source}")
+
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    item_collection = job_ref.collection("items")
+    added = 0
+
+    for item in items:
+        source_id = str(item.get("source_id", "")).strip()
+        if not source_id:
+            raise ValueError("Each sync job item requires a source_id.")
+        dedupe_key = str(item.get("dedupe_key") or source_id).strip()
+        if not dedupe_key:
+            raise ValueError("Each sync job item requires a non-empty dedupe_key.")
+
+        item_ref = item_collection.document(_sync_item_document_id(source, dedupe_key))
+        source_ref = _sync_source_item_reference(db_fs, source, source_id, dedupe_key)
+        if source_ref.get().exists:
+            continue
+
+        now = _sync_timestamp()
+        item_data = {
+            "source": source,
+            "source_id": source_id,
+            "dedupe_key": dedupe_key,
+            "source_url": _sync_source_url(source, source_id),
+            "name": item.get("name", source_id),
+            "created_time": item.get("created_time"),
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "next_attempt_at": None,
+            "lease_expires_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+            "metadata": item.get("metadata", {}),
+            "created_at": now,
+            "updated_at": now,
+        }
+        batch = db_fs.batch()
+        batch.set(item_ref, item_data)
+        batch.set(source_ref, {
+            "source": source,
+            "source_id": source_id,
+            "dedupe_key": dedupe_key,
+            "job_id": job_id,
+            "item_id": item_ref.id,
+            "status": _SYNC_ITEM_PENDING,
+            "created_time": item.get("created_time"),
+            "created_at": now,
+            "updated_at": now,
+        })
+        batch.commit()
+        added += 1
+
+    has_items = any(item_collection.limit(1).stream())
+    job_ref.set({
+        "status": "queued" if has_items else "completed",
+        "updated_at": _sync_timestamp(),
+        "completed_at": _sync_timestamp() if not has_items else None,
+    }, merge=True)
+    return added
+
+
+def _claim_next_sync_item(job_id: str) -> Optional[dict]:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    now = datetime.now(timezone.utc)
+    item_doc = None
+    item = None
+    for candidate in job_ref.collection("items").order_by("created_at").stream():
+        candidate_item = candidate.to_dict()
+        if candidate_item.get("status") != _SYNC_ITEM_PENDING:
+            continue
+        next_attempt_at = candidate_item.get("next_attempt_at")
+        if next_attempt_at:
+            try:
+                next_attempt = datetime.fromisoformat(next_attempt_at.replace("Z", "+00:00"))
+            except ValueError:
+                next_attempt = now
+            if next_attempt > now:
+                continue
+        item_doc = candidate
+        item = candidate_item
+        break
+
+    if item_doc is None or item is None:
+        return None
+
+    item_doc.reference.update({
+        "status": _SYNC_ITEM_PROCESSING,
+        "attempts": int(item.get("attempts", 0)) + 1,
+        "started_at": now.isoformat(),
+        "next_attempt_at": None,
+        "lease_expires_at": (now + timedelta(seconds=_SYNC_PROCESSING_LEASE_SECONDS)).isoformat(),
+        "updated_at": now.isoformat(),
+        "error": None,
+    })
+    _sync_source_item_reference(
+        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+    ).set({
+        "status": _SYNC_ITEM_PROCESSING,
+        "attempts": int(item.get("attempts", 0)) + 1,
+        "updated_at": now.isoformat(),
+    }, merge=True)
+    item["id"] = item_doc.id
+    item["attempts"] = int(item.get("attempts", 0)) + 1
+    return item
+
+
+def _complete_sync_item(job_id: str, item_id: str, chunks_stored: int) -> None:
+    now = _sync_timestamp()
+    db_fs = _sync_jobs_client()
+    item_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).collection("items").document(item_id)
+    item = item_ref.get().to_dict() or {}
+    item_ref.update({
+        "status": _SYNC_ITEM_COMPLETED,
+        "chunks_stored": chunks_stored,
+        "completed_at": now,
+        "lease_expires_at": None,
+        "updated_at": now,
+        "error": None,
+    })
+    _sync_source_item_reference(
+        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+    ).set({
+        "status": _SYNC_ITEM_COMPLETED,
+        "chunks_stored": chunks_stored,
+        "completed_at": now,
+        "updated_at": now,
+        "error": None,
+    }, merge=True)
+
+
+def _fail_sync_item(job_id: str, item_id: str, error: str, retryable: bool = True) -> None:
+    db_fs = _sync_jobs_client()
+    item_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).collection("items").document(item_id)
+    item = item_ref.get().to_dict() or {}
+    attempts = int(item.get("attempts", 0))
+    next_status = _SYNC_ITEM_PENDING if retryable and attempts < _SYNC_MAX_ATTEMPTS else _SYNC_ITEM_FAILED
+    retry_delay = min(
+        _SYNC_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)),
+        _SYNC_RETRY_MAX_SECONDS,
+    )
+    next_attempt_at = (
+        (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
+        if next_status == _SYNC_ITEM_PENDING else None
+    )
+    item_ref.update({
+        "status": next_status,
+        "lease_expires_at": None,
+        "next_attempt_at": next_attempt_at,
+        "updated_at": _sync_timestamp(),
+        "error": error[:2000],
+    })
+    _sync_source_item_reference(
+        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+    ).set({
+        "status": next_status,
+        "attempts": attempts,
+        "updated_at": _sync_timestamp(),
+        "error": error[:2000],
+    }, merge=True)
+
+
+def _recover_stale_sync_items(job_id: str) -> int:
+    db_fs = _sync_jobs_client()
+    stale_before = datetime.now(timezone.utc)
+    recovered = 0
+    for item_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).collection("items").where(
+        "status", "==", _SYNC_ITEM_PROCESSING
+    ).stream():
+        item = item_doc.to_dict()
+        lease_expires_at = item.get("lease_expires_at")
+        if not lease_expires_at:
+            continue
+        try:
+            lease_expiry = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            lease_expiry = stale_before
+        if lease_expiry > stale_before:
+            continue
+        _fail_sync_item(job_id, item_doc.id, "Processing lease expired after an interrupted worker.")
+        recovered += 1
+    return recovered
+
+
+def _refresh_sync_job_status(job_id: str) -> None:
+    job_ref = _sync_jobs_client().collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    statuses = [
+        item_doc.to_dict().get("status")
+        for item_doc in job_ref.collection("items").stream()
+    ]
+    if not statuses:
+        job_ref.set({
+            "status": "completed",
+            "completed_at": _sync_timestamp(),
+            "updated_at": _sync_timestamp(),
+        }, merge=True)
+        return
+
+    if _SYNC_ITEM_PENDING in statuses or _SYNC_ITEM_PROCESSING in statuses:
+        job_ref.set({"status": "running", "updated_at": _sync_timestamp()}, merge=True)
+        return
+
+    job_ref.set({
+        "status": "completed" if _SYNC_ITEM_FAILED not in statuses else "completed_with_failures",
+        "completed_at": _sync_timestamp(),
+        "updated_at": _sync_timestamp(),
+    }, merge=True)
+
+
+def _claim_next_sync_work() -> Optional[tuple[str, dict]]:
+    db_fs = _sync_jobs_client()
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).order_by("created_at").stream():
+        job = job_doc.to_dict()
+        if job.get("status") not in {"queued", "running", "discovering"}:
+            continue
+        _recover_stale_sync_items(job_doc.id)
+        item = _claim_next_sync_item(job_doc.id)
+        if item:
+            job_doc.reference.set({"status": "running", "updated_at": _sync_timestamp()}, merge=True)
+            return job_doc.id, item
+        _refresh_sync_job_status(job_doc.id)
+    return None
+
+
+def _run_index_mutation(operation):
+    with _index_write_lock:
+        return operation()
+
+
+def _serialized_index_mutation(handler):
+    if inspect.iscoroutinefunction(handler):
+        @functools.wraps(handler)
+        async def async_wrapped(*args, **kwargs):
+            with _index_write_lock:
+                return await handler(*args, **kwargs)
+        return async_wrapped
+
+    @functools.wraps(handler)
+    def wrapped(*args, **kwargs):
+        return _run_index_mutation(lambda: handler(*args, **kwargs))
+    return wrapped
+
+
+def _process_gdrive_sync_item(item: dict) -> int:
+    file_id = item["source_id"]
+    file_name = Path(item.get("name") or file_id).name
+    if not file_name or file_name == ".":
+        raise ValueError("Google Drive sync item has no usable filename.")
+
+    drive_service = _get_gdrive_service()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = Path(tmpdir) / file_name
+        _download_gdrive_file_to_path(drive_service, file_id, local_path)
+
+        def ingest() -> int:
+            rag = _get_rag()
+            chunks_stored = rag.ingest_file(
+                str(local_path),
+                section="gdrive",
+                source_url=item["source_url"],
+            )
+            if chunks_stored <= 0:
+                raise RuntimeError("No indexable content was extracted from the Google Drive file.")
+            _save_and_sync(rag)
+            return chunks_stored
+
+        return _run_index_mutation(ingest)
+
+
+def _process_blog_sync_item(item: dict) -> int:
+    metadata = item.get("metadata", {})
+    title = metadata.get("title") or item.get("name") or item["source_id"]
+    pdf_url = (metadata.get("pdf_url") or "").strip()
+
+    def ingest_text() -> int:
+        content = (metadata.get("content") or "").strip()
+        if not content:
+            raise RuntimeError("Blog item has no indexable text content.")
+        rag = _get_rag()
+        chunks_stored = rag.ingest_raw_documents([{
+            "title": title,
+            "content": content,
+            "section": "blogs",
+            "url": item["source_url"],
+        }])
+        if chunks_stored <= 0:
+            raise RuntimeError("No indexable content was extracted from the blog entry.")
+        _save_and_sync(rag)
+        return chunks_stored
+
+    if not pdf_url:
+        return _run_index_mutation(ingest_text)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = Path(tmpdir) / f"{item['source_id']}.pdf"
+        response = _req.get(pdf_url, stream=True, timeout=60)
+        response.raise_for_status()
+        with open(local_path, "wb") as file_handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    file_handle.write(chunk)
+
+        def ingest_pdf() -> int:
+            rag = _get_rag()
+            chunks_stored = rag.ingest_file(
+                str(local_path),
+                section="blogs",
+                source_url=item["source_url"],
+            )
+            if chunks_stored <= 0:
+                raise RuntimeError("No indexable content was extracted from the blog PDF.")
+            _save_and_sync(rag)
+            return chunks_stored
+
+        return _run_index_mutation(ingest_pdf)
+
+
+def _process_youtube_sync_item(item: dict) -> int:
+    video_url = item["source_url"]
+
+    def ingest() -> int:
+        rag = _get_rag()
+        chunks_stored = rag.ingest_videos([video_url], section="video")
+        if chunks_stored <= 0:
+            raise RuntimeError("No indexable content was extracted from the YouTube video.")
+        _save_and_sync(rag)
+        return chunks_stored
+
+    return _run_index_mutation(ingest)
+
+
+def _process_sync_item(item: dict) -> int:
+    if item.get("source") == "gdrive":
+        return _process_gdrive_sync_item(item)
+    if item.get("source") == "blogs":
+        return _process_blog_sync_item(item)
+    if item.get("source") == "youtube":
+        return _process_youtube_sync_item(item)
+    raise RuntimeError(f"No worker handler is registered for sync source {item.get('source')!r}.")
+
+
+def _wake_sync_worker() -> None:
+    if _sync_worker_wakeup is not None:
+        _sync_worker_wakeup.set()
+
+
+async def _wait_for_sync_worker_wakeup() -> None:
+    if _sync_worker_wakeup is None:
+        await asyncio.sleep(_SYNC_WORKER_POLL_SECONDS)
+        return
+    try:
+        await asyncio.wait_for(_sync_worker_wakeup.wait(), timeout=_SYNC_WORKER_POLL_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _sync_worker_loop() -> None:
+    logger.info("Sync worker started.")
+    while True:
+        try:
+            if _sync_worker_wakeup is not None:
+                _sync_worker_wakeup.clear()
+
+            if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
+                await _wait_for_sync_worker_wakeup()
+                continue
+
+            work = await asyncio.to_thread(_claim_next_sync_work)
+            if not work:
+                await _wait_for_sync_worker_wakeup()
+                continue
+
+            job_id, item = work
+            try:
+                chunks_stored = await asyncio.to_thread(_process_sync_item, item)
+                await asyncio.to_thread(_complete_sync_item, job_id, item["id"], chunks_stored)
+            except Exception as exc:
+                logger.exception("Sync worker failed job=%s item=%s", job_id, item["id"])
+                await asyncio.to_thread(_fail_sync_item, job_id, item["id"], str(exc))
+            finally:
+                await asyncio.to_thread(_refresh_sync_job_status, job_id)
+        except asyncio.CancelledError:
+            logger.info("Sync worker stopped.")
+            raise
+        except Exception as exc:
+            logger.exception("Sync worker loop error: %s", exc)
+            await _wait_for_sync_worker_wakeup()
+
+
+def _start_sync_worker() -> None:
+    global _sync_worker_task, _sync_worker_wakeup
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
+        return
+    if _sync_worker_task is not None and not _sync_worker_task.done():
+        return
+    _sync_worker_wakeup = asyncio.Event()
+    _sync_worker_task = asyncio.create_task(_sync_worker_loop(), name="sync-worker")
+
+
+async def _stop_sync_worker() -> None:
+    global _sync_worker_task, _sync_worker_wakeup
+    if _sync_worker_task is None:
+        return
+    _sync_worker_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await _sync_worker_task
+    _sync_worker_task = None
+    _sync_worker_wakeup = None
+
+
+def _sync_job_status(job_id: str, item_limit: int = 100, item_offset: int = 0) -> dict:
+    db_fs = _sync_jobs_client()
+    job_doc = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    counts = {item_status: 0 for item_status in _SYNC_ITEM_STATUSES}
+    items = []
+    for item_index, item_doc in enumerate(
+        job_doc.reference.collection("items").order_by("created_at").stream()
+    ):
+        item = item_doc.to_dict()
+        item["id"] = item_doc.id
+        if item_offset <= item_index < item_offset + item_limit:
+            items.append(item)
+        item_status = item.get("status")
+        if item_status in counts:
+            counts[item_status] += 1
+
+    job = job_doc.to_dict()
+    job["id"] = job_doc.id
+    job["counts"] = counts
+    job["items"] = items
+    job["item_offset"] = item_offset
+    job["next_item_offset"] = (
+        item_offset + item_limit
+        if item_offset + item_limit < sum(counts.values()) else None
+    )
+    return job
+
+
+def _list_sync_jobs(limit: int = 20) -> list[dict]:
+    from google.cloud.firestore import Query as FirestoreQuery
+
+    db_fs = _sync_jobs_client()
+    jobs = []
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).order_by(
+        "created_at", direction=FirestoreQuery.DESCENDING
+    ).limit(limit).stream():
+        job = job_doc.to_dict()
+        job["id"] = job_doc.id
+        jobs.append(job)
+    return jobs
 
 
 def _load_model_from_firestore() -> Optional[str]:
@@ -955,6 +1499,13 @@ async def startup_event():
         logger.info("Startup: RAG index loaded and ready.")
     except Exception as exc:
         logger.error("Startup: RAG warm-up failed — first query will trigger lazy load. Error: %s", exc)
+
+    _start_sync_worker()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await _stop_sync_worker()
 
 
 @app.get("/")
@@ -1452,6 +2003,7 @@ def update_config(body: ConfigUpdate, _: AdminDep):
 
 
 @app.post("/ingest")
+@_serialized_index_mutation
 def ingest(body: IngestRequest, _: AdminDep):
     rag = _get_rag()
     if body.rebuild:
@@ -1505,6 +2057,7 @@ def get_document_chunks(doc_index: int, _: AdminDep):
 
 
 @app.delete("/documents/{doc_title:path}")
+@_serialized_index_mutation
 def delete_document(doc_title: str, _: AdminDep):
     """Delete all chunks for a specific document title."""
     rag = _get_rag()
@@ -1543,11 +2096,29 @@ def list_sessions_history(_: AdminDep, limit: int = 20, offset: int = 0):
     return result
 
 
+@app.get("/sync-jobs")
+def list_sync_jobs(_: AdminDep, limit: int = Query(20, ge=1, le=100)):
+    """Return recent durable auto-sync jobs."""
+    return {"jobs": _list_sync_jobs(limit)}
+
+
+@app.get("/sync-jobs/{job_id}")
+def get_sync_job(
+    job_id: str,
+    _: AdminDep,
+    item_limit: int = Query(100, ge=1, le=500),
+    item_offset: int = Query(0, ge=0),
+):
+    """Return one auto-sync job, its status counts, and its items."""
+    return _sync_job_status(job_id, item_limit, item_offset)
+
+
 # ---------------------------------------------------------------------------
 # Additional ingest endpoints  (admin)
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest/folder")
+@_serialized_index_mutation
 def ingest_folder(
     _: AdminDep,
     section: str = Form("general"),
@@ -1612,6 +2183,7 @@ def ingest_folder(
 
 
 @app.post("/ingest/documents")
+@_serialized_index_mutation
 def ingest_documents(body: RawDocumentsRequest, _: AdminDep):
     """
     Inject pre-written text documents directly into the index.
@@ -1633,6 +2205,7 @@ def ingest_documents(body: RawDocumentsRequest, _: AdminDep):
 
 
 @app.post("/ingest/videos")
+@_serialized_index_mutation
 def ingest_videos(body: VideosIngestRequest, _: AdminDep):
     """
     Summarise a list of YouTube video URLs or playlist URLs via Gemini.
@@ -1671,6 +2244,7 @@ def cleanup_preview(body: CleanupRequest, _: AdminDep):
 
 
 @app.post("/cleanup/apply")
+@_serialized_index_mutation
 def cleanup_apply(body: CleanupRequest, _: AdminDep):
     """
     Apply the same filters as /cleanup/preview and permanently delete matched chunks.
@@ -1693,8 +2267,11 @@ def cleanup_apply(body: CleanupRequest, _: AdminDep):
 # ---------------------------------------------------------------------------
 
 @app.delete("/index")
+@_serialized_index_mutation
 def clear_index(_: AdminDep):
-    _get_rag().db.clear()
+    rag = _get_rag()
+    rag.db.clear()
+    _save_and_sync(rag)
     return {"cleared": "faiss_index"}
 
 
@@ -1703,8 +2280,24 @@ def clear_index(_: AdminDep):
 # ---------------------------------------------------------------------------
 
 @app.get("/youtube/notify")
-async def youtube_verify(hub_challenge: str = Query(..., alias="hub.challenge")):
+async def youtube_verify(
+    hub_challenge: str = Query(..., alias="hub.challenge"),
+    hub_topic: Optional[str] = Query(None, alias="hub.topic"),
+):
     """YouTube calls this once on subscription to verify the endpoint is real."""
+    if hub_topic:
+        channel_id = hub_topic.rsplit("channel_id=", 1)[-1]
+        if channel_id and channel_id != hub_topic:
+            try:
+                _sync_jobs_client().collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
+                    "channel_id": channel_id,
+                    "topic": hub_topic,
+                    "status": "verified",
+                    "verified_at": _sync_timestamp(),
+                    "updated_at": _sync_timestamp(),
+                }, merge=True)
+            except Exception:
+                logger.exception("Unable to record YouTube subscription verification for %s", channel_id)
     return PlainTextResponse(hub_challenge)
 
 
@@ -1712,7 +2305,7 @@ async def youtube_verify(hub_challenge: str = Query(..., alias="hub.challenge"))
 async def youtube_notify(request: Request):
     """
     YouTube POSTs an Atom XML payload here within seconds of a new upload.
-    Parses the video ID and runs the existing ingest_videos pipeline.
+    It records video IDs durably and returns before background ingestion begins.
     """
     body = await request.body()
 
@@ -1723,28 +2316,45 @@ async def youtube_notify(request: Request):
         if not hmac.compare_digest(sig, expected):
             raise HTTPException(status_code=403, detail="Invalid signature")
 
-    root = ET.fromstring(body)
-    ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
-    videos_processed = 0
-    errors = []
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid YouTube notification XML: {exc}")
 
-    for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
+    ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
+    atom_namespace = "{http://www.w3.org/2005/Atom}"
+    items = []
+
+    for entry in root.iter(f"{atom_namespace}entry"):
         vid_el = entry.find("yt:videoId", ns)
         if vid_el is not None and vid_el.text:
-            url = f"https://www.youtube.com/watch?v={vid_el.text.strip()}"
-            try:
-                logger.info("PubSubHubbub: new video detected %s", url)
-                rag = _get_rag()
-                rag.ingest_videos([url])
-                _save_and_sync(rag)
-                videos_processed += 1
-            except Exception as e:
-                logger.error("PubSubHubbub: failed to ingest video %s: %s", url, e)
-                errors.append({"url": url, "error": str(e)})
+            video_id = vid_el.text.strip()
+            if not video_id:
+                continue
+            title = entry.findtext(f"{atom_namespace}title") or video_id
+            published_at = (
+                entry.findtext(f"{atom_namespace}published")
+                or entry.findtext(f"{atom_namespace}updated")
+            )
+            items.append({
+                "source_id": video_id,
+                "name": title.strip(),
+                "created_time": published_at,
+                "metadata": {"title": title.strip()},
+            })
 
-    if errors:
-        logger.warning("PubSubHubbub: %d video(s) failed to ingest out of %d",
-                      len(errors), videos_processed + len(errors))
+    if not items:
+        return Response(status_code=204)
+
+    try:
+        job_id = _create_sync_job("youtube", metadata={"notification_received_at": _sync_timestamp()})
+        queued = _add_sync_job_items(job_id, "youtube", items)
+    except Exception:
+        logger.exception("Unable to queue YouTube notification items")
+        raise HTTPException(status_code=503, detail="Unable to queue YouTube notification.")
+
+    logger.info("PubSubHubbub: notification queued job=%s discovered=%d queued=%d", job_id, len(items), queued)
+    _wake_sync_worker()
 
     return Response(status_code=204)
 
@@ -1769,6 +2379,12 @@ def youtube_resubscribe(request: Request):
     secret   = os.environ.get("PUBSUB_SECRET", "")
 
     results = []
+    db_fs = None
+    try:
+        db_fs = _sync_jobs_client()
+    except Exception:
+        logger.exception("Unable to initialize Firestore for YouTube subscription tracking")
+
     for cid in channel_ids:
         topic = f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"
         data  = {
@@ -1779,115 +2395,33 @@ def youtube_resubscribe(request: Request):
         }
         if secret:
             data["hub.secret"] = secret
-        resp = _req.post("https://pubsubhubbub.appspot.com/subscribe", data=data, timeout=15)
-        results.append({"channel_id": cid, "http_status": resp.status_code})
-        logger.info("PubSubHubbub subscribe: channel=%s status=%d", cid, resp.status_code)
+        try:
+            resp = _req.post("https://pubsubhubbub.appspot.com/subscribe", data=data, timeout=15)
+            request_status = "requested" if resp.status_code == 202 else "rejected"
+            result = {"channel_id": cid, "http_status": resp.status_code, "status": request_status}
+        except Exception as exc:
+            logger.error("PubSubHubbub subscribe request failed for %s: %s", cid, exc)
+            result = {"channel_id": cid, "status": "request_failed", "error": str(exc)}
+
+        results.append(result)
+        logger.info("PubSubHubbub subscribe: channel=%s status=%s", cid, result["status"])
+        if db_fs is not None:
+            try:
+                db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(cid).set({
+                    "channel_id": cid,
+                    "topic": topic,
+                    "callback": callback,
+                    "status": result["status"],
+                    "http_status": result.get("http_status"),
+                    "error": result.get("error"),
+                    "requested_at": _sync_timestamp(),
+                    "updated_at": _sync_timestamp(),
+                }, merge=True)
+            except Exception:
+                logger.exception("Unable to record YouTube subscription request for %s", cid)
 
     return {"resubscribed": results}
 
-
-# ---------------------------------------------------------------------------
-# OneDrive weekly sync  (automatic new-file ingestion)
-# ---------------------------------------------------------------------------
-@app.post("/onedrive/sync")
-def onedrive_sync():
-    """
-    List files in the shared OneDrive folder, ingest any added/modified .m4a files
-    since the last sync, and update the last_sync_time in Firestore.
-    Called weekly by Cloud Scheduler.
-    """
-    import base64
-
-    share_url = os.environ.get("ONEDRIVE_SHARE_URL", "")
-    if not share_url:
-        return {"synced": 0, "warning": "ONEDRIVE_SHARE_URL not set"}
-
-    # Get OAuth2 token for Graph API authentication
-    token = _get_microsoft_graph_token()
-    headers = {"Authorization": f"Bearer {token}"}
-
-    encoded = base64.urlsafe_b64encode(("u!" + share_url).encode()).decode().rstrip("=")
-    try:
-        resp = _req.get(
-            f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem/children",
-            params={"$select": "id,name,lastModifiedDateTime,file,@microsoft.graph.downloadUrl"},
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("onedrive_sync: Graph API error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"OneDrive API error: {exc}")
-
-    # MODIFICATION: Strictly filter for files ending in .m4a (case-insensitive)
-    all_files = [
-        item for item in resp.json().get("value", []) 
-        if "file" in item and item.get("name", "").lower().endswith(".m4a")
-    ]
-
-    last_sync_time: Optional[str] = None
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    if project:
-        try:
-            db_fs = _firestore_client()
-            doc = db_fs.collection("system_config").document("onedrive_sync").get()
-            if doc.exists:
-                last_sync_time = doc.to_dict().get("last_sync_time")
-        except Exception as exc:
-            logger.warning("onedrive_sync: Firestore read failed: %s", exc)
-
-    new_files = [
-        f for f in all_files
-        if last_sync_time is None or f["lastModifiedDateTime"] > last_sync_time
-    ]
-
-    if not new_files:
-        return {"synced": 0, "message": "No new .m4a files since last sync"}
-
-    rag = _get_rag()
-    total_chunks = 0
-    synced_names = []
-    max_ingested_time = last_sync_time
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for item in new_files:
-            download_url = item.get("@microsoft.graph.downloadUrl")
-            if not download_url:
-                logger.warning("onedrive_sync: no download URL for %s", item["name"])
-                continue
-            try:
-                # Stream the download just to be safe with memory
-                response = _req.get(download_url, headers=headers, stream=True, timeout=60)
-                response.raise_for_status()
-
-                dest = os.path.join(tmpdir, item["name"])
-                with open(dest, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-
-                synced_names.append(item["name"])
-                max_ingested_time = item["lastModifiedDateTime"]
-                logger.info("onedrive_sync: downloaded %s", item["name"])
-            except Exception as exc:
-                logger.warning("onedrive_sync: failed to download %s: %s", item["name"], exc)
-
-        if synced_names:
-            # rag.ingest_folder will now only see the .m4a files downloaded
-            total_chunks = rag.ingest_folder(tmpdir, section="onedrive", recursive=False)
-
-    if total_chunks > 0:
-        _save_and_sync(rag)
-
-    if project and synced_names:
-        try:
-            db_fs = _firestore_client()
-            db_fs.collection("system_config").document("onedrive_sync").set(
-                {"last_sync_time": max_ingested_time}, merge=True
-            )
-        except Exception as exc:
-            logger.warning("onedrive_sync: Firestore write failed: %s", exc)
-
-    return {"synced": len(synced_names), "chunks_stored": total_chunks, "files": synced_names}
 
 # ---------------------------------------------------------------------------
 # Google Drive weekly sync (automatic new-file ingestion)
@@ -1895,8 +2429,8 @@ def onedrive_sync():
 @app.post("/gdrive/sync")
 def gdrive_sync():
     """
-    List files newly created in the shared Google Drive folder, ingest them,
-    since the last sync, and update the last_sync_time in Firestore.
+    Discover newly created supported files and queue them for background ingestion.
+    The last_sync_time checkpoint is advanced only after all items are durable.
     Called weekly by Cloud Scheduler.
     """
     if not GDRIVE_FOLDER_ID:
@@ -1920,10 +2454,8 @@ def gdrive_sync():
         logger.error("gdrive_sync: Failed to read Drive folder %s: %s", GDRIVE_FOLDER_ID, e)
         raise HTTPException(status_code=502, detail=f"Google Drive folder unavailable: {e}")
 
-    # Get last sync time
     last_sync_time = None
     project = os.environ.get('GOOGLE_CLOUD_PROJECT', '')
-
     if project:
         sync_state = _get_gdrive_sync_state()
         if sync_state:
@@ -1931,13 +2463,10 @@ def gdrive_sync():
 
     logger.info("gdrive_sync: last_sync_time=%s", last_sync_time or "none")
 
-    # Build query for files. createdTime is the Drive creation time, so files
-    # uploaded directly into this folder after the checkpoint are included.
     query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false"
     if last_sync_time:
         query += f" and createdTime > '{last_sync_time}'"
 
-    # List files (with pagination for folders with >100 files)
     all_files = []
     page_token = None
     try:
@@ -1958,17 +2487,11 @@ def gdrive_sync():
         logger.error(f"gdrive_sync: Google Drive API error: {e}")
         raise HTTPException(status_code=502, detail=f"Google Drive API error: {e}")
 
-    # Filter for supported file types
-    supported_types = [
-        'application/pdf',
-        'text/plain',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'audio/mpeg',
-        'audio/mp4',
-        'application/x-m4a'
+    from orchestrator import _ALL_SUPPORTED
+    new_files = [
+        item for item in all_files
+        if Path(item.get('name', '')).suffix.lower() in _ALL_SUPPORTED
     ]
-
-    new_files = [f for f in all_files if f.get('mimeType') in supported_types]
 
     if not new_files:
         return {
@@ -1979,77 +2502,37 @@ def gdrive_sync():
             "files_matched": len(all_files),
         }
 
-    rag = _get_rag()
-    total_chunks = 0
-    synced_names = []
-    max_ingested_time = last_sync_time
+    newest_created_time = max(item["createdTime"] for item in new_files)
+    job_id = _create_sync_job(
+        "gdrive",
+        discovered_after=last_sync_time,
+        metadata={"folder": folder_info, "files_matched": len(all_files)},
+    )
+    queued = _add_sync_job_items(job_id, "gdrive", [
+        {
+            "source_id": item["id"],
+            "name": item["name"],
+            "created_time": item["createdTime"],
+            "metadata": {
+                "mime_type": item.get("mimeType"),
+                "size": item.get("size"),
+                "folder_id": GDRIVE_FOLDER_ID,
+            },
+        }
+        for item in new_files
+    ])
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for item in new_files:
-            file_id = item['id']
-            file_name = item['name']
+    if project:
+        _save_gdrive_sync_state(newest_created_time)
 
-            try:
-                # Download file
-                file_bytes = _download_gdrive_file(drive_service, file_id)
-
-                # Save to temp directory
-                dest = os.path.join(tmpdir, file_name)
-                with open(dest, 'wb') as f:
-                    f.write(file_bytes)
-
-                synced_names.append(file_name)
-                item_created_time = item.get('createdTime')
-                if item_created_time and (
-                    max_ingested_time is None or item_created_time > max_ingested_time
-                ):
-                    max_ingested_time = item_created_time
-                logger.info(f"gdrive_sync: downloaded {file_name}")
-
-            except Exception as e:
-                logger.warning(f"gdrive_sync: failed to download {file_name}: {e}")
-                continue
-
-        # Ingest files
-        if synced_names:
-            try:
-                total_chunks = rag.ingest_folder(tmpdir, section='gdrive', recursive=False)
-            except Exception as e:
-                logger.error(f"gdrive_sync: Ingestion failed: {e}")
-                return {
-                    "synced": len(synced_names),
-                    "chunks_stored": 0,
-                    "files": synced_names,
-                    "last_sync_time": last_sync_time,
-                    "folder": folder_info,
-                    "error": f"Ingestion failed: {str(e)}"
-                }
-
-    # Save index and update sync state ONLY if ingestion succeeded
-    if total_chunks > 0:
-        try:
-            _save_and_sync(rag)
-        except Exception as e:
-            logger.error(f"gdrive_sync: Failed to save index to GCS: {e}")
-            return {
-                "synced": len(synced_names),
-                "chunks_stored": total_chunks,
-                "files": synced_names,
-                "last_sync_time": last_sync_time,
-                "folder": folder_info,
-                "error": f"GCS save failed: {str(e)}"
-            }
-        # Only save sync state AFTER successful GCS upload
-        if project:
-            _save_gdrive_sync_state(max_ingested_time)
-
+    _wake_sync_worker()
     return {
-        "synced": len(synced_names),
-        "chunks_stored": total_chunks,
-        "files": synced_names,
+        "job_id": job_id,
+        "queued": queued,
+        "discovered": len(new_files),
         "last_sync_time": last_sync_time,
+        "next_sync_after": newest_created_time,
         "folder": folder_info,
-        "next_sync_after": max_ingested_time
     }
 
 # ---------------------------------------------------------------------------
@@ -2058,9 +2541,10 @@ def gdrive_sync():
 @app.post("/blogs/sync")
 def blogs_sync():
     """
-    Fetch blogs from the external CMS, filter for new posts since the last run,
-    and process them natively using the appropriate RAG pipeline strategy.
-    Called weekly by Cloud Scheduler.
+    Discover new or updated CMS blogs and enqueue their ingestion.
+
+    The background worker processes one queued blog at a time, so the scheduler
+    request completes without waiting for PDF download, extraction, or indexing.
     """
 
     import urllib3
@@ -2068,133 +2552,129 @@ def blogs_sync():
     # Suppress insecure request warnings caused by the expired CMS SSL cert
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    # 1. Look up the last execution checkpoint from Firestore
     last_sync_time: Optional[str] = None
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    
-    if project:
-        try:
-            db_fs = _firestore_client()
-            doc = db_fs.collection("system_config").document("blog_sync").get()
-            if doc.exists:
-                last_sync_time = doc.to_dict().get("last_sync_time")
-        except Exception as exc:
-            logger.warning("blogs_sync: Firestore read failed: %s", exc)
-
-    # Convert checkpoint string to datetime if it exists
-    last_sync_datetime = None
-    if last_sync_time:
-        last_sync_datetime = datetime.fromisoformat(last_sync_time.split("+")[0])
-
-    # 2. Query the external CMS API
-    api_url = os.environ.get("SWATI_DESAI_API")
-    payload = {"pageIndex": 0, "pageSize": 100}
-    headers = {"accept": "text/plain", "Content-Type": "application/json"}
+    db_fs = _sync_jobs_client()
+    try:
+        doc = db_fs.collection("system_config").document("blog_sync").get()
+        if doc.exists:
+            last_sync_time = doc.to_dict().get("last_sync_time")
+    except Exception as exc:
+        logger.error("blogs_sync: Firestore checkpoint read failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Blog sync checkpoint is unavailable.")
 
     try:
-        resp = _req.post(api_url, json=payload, headers=headers, verify=False, timeout=30)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("blogs_sync: CMS API connectivity error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Blog CMS API error: {exc}")
+        last_sync_datetime = _parse_sync_datetime(last_sync_time) if last_sync_time else None
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid blog sync checkpoint: {exc}")
 
-    all_blogs = resp.json().get("data", [])
+    api_url = os.environ.get("SWATI_DESAI_API")
+    if not api_url:
+        raise HTTPException(status_code=503, detail="SWATI_DESAI_API is not configured.")
+    headers = {"accept": "text/plain", "Content-Type": "application/json"}
+
+    all_blogs = []
+    seen_blog_versions = set()
+    page_index = 0
+    page_size = 100
+    while True:
+        try:
+            resp = _req.post(
+                api_url,
+                json={"pageIndex": page_index, "pageSize": page_size},
+                headers=headers,
+                verify=False,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            page_blogs = resp.json().get("data", [])
+        except Exception as exc:
+            logger.error("blogs_sync: CMS API connectivity error: %s", exc)
+            raise HTTPException(status_code=502, detail=f"Blog CMS API error: {exc}")
+
+        if not isinstance(page_blogs, list):
+            raise HTTPException(status_code=502, detail="Blog CMS API returned an invalid data payload.")
+
+        unique_on_page = 0
+        for blog in page_blogs:
+            blog_id = str(blog.get("id", "")).strip()
+            blog_version = blog.get("updatedDate") or blog.get("createdDate") or ""
+            dedupe_key = f"{blog_id}:{blog_version}"
+            if not blog_id or dedupe_key in seen_blog_versions:
+                continue
+            seen_blog_versions.add(dedupe_key)
+            all_blogs.append(blog)
+            unique_on_page += 1
+
+        if len(page_blogs) < page_size or unique_on_page == 0:
+            break
+        page_index += 1
+
     new_blogs = []
 
-    # Filter out entries already processed
+    newest_timestamp = last_sync_datetime
     for blog in all_blogs:
+        blog_id = str(blog.get("id", "")).strip()
         updated_date_str = blog.get("updatedDate") or blog.get("createdDate")
-        if not updated_date_str:
+        if not blog_id or not updated_date_str:
             continue
-        
-        blog_datetime = datetime.fromisoformat(updated_date_str)
+        try:
+            blog_datetime = _parse_sync_datetime(updated_date_str)
+        except ValueError:
+            logger.warning("blogs_sync: skipping %s with invalid timestamp %r", blog_id, updated_date_str)
+            continue
         if last_sync_datetime is None or blog_datetime > last_sync_datetime:
             new_blogs.append((blog, blog_datetime))
+            if newest_timestamp is None or blog_datetime > newest_timestamp:
+                newest_timestamp = blog_datetime
 
     if not new_blogs:
-        return {"synced": 0, "message": "No new blog entries discovered since last sync."}
+        return {
+            "queued": 0,
+            "message": "No new or updated blog entries discovered since last sync.",
+            "last_sync_time": last_sync_time,
+        }
 
-    rag = _get_rag()
-    total_chunks = 0
-    processed_titles = []
-    newest_timestamp = last_sync_datetime or datetime(1970, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-
-    # Arrays to isolate batch workloads
-    raw_text_docs = []
-
-    # 3. Process each unique new blog
+    job_id = _create_sync_job(
+        "blogs",
+        discovered_after=last_sync_time,
+        metadata={"cms_api": api_url},
+    )
+    items = []
     for blog, blog_datetime in new_blogs:
-        title = blog.get("name", "Untitled Blog")
-        pdf_url = blog.get("document")
-
-        # --- Pipeline Strategy Selection ---
-        if pdf_url and pdf_url.strip():
-            # STRATEGY A: PDF Document Present -> Use Folder Ingestion Pipeline Logic
-            logger.info("blogs_sync: processing via PDF pipeline -> %s", title)
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    pdf_resp = _req.get(pdf_url, stream=True, timeout=60)
-                    pdf_resp.raise_for_status()
-                    
-                    # Create a clean safe filename from the blog ID or Title
-                    safe_filename = f"{blog.get('id', 'doc')}.pdf"
-                    dest = os.path.join(tmpdir, safe_filename)
-                    
-                    with open(dest, "wb") as f:
-                        for chunk in pdf_resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    # Natively route through folder chunker pipeline
-                    chunks = rag.ingest_folder(tmpdir, section="blogs", recursive=False)
-                    total_chunks += chunks
-                    processed_titles.append(f"[PDF] {title}")
-            except Exception as exc:
-                logger.error("blogs_sync: failed to download document for %s: %s", title, exc)
-                continue
-        else:
-            # STRATEGY B: No Document -> Compile Text Data and Use Raw Document Pipeline
-            logger.info("blogs_sync: processing via Raw Text pipeline -> %s", title)
-            sub_desc = blog.get("subDescription") or ""
-            desc = blog.get("description") or ""
-
-            # Combine the body text components natively
-            full_text = f"{sub_desc}\n\n{desc}".strip()
-
-            raw_text_docs.append({
+        blog_id = str(blog["id"])
+        title = blog.get("name") or "Untitled Blog"
+        content = "\n\n".join(filter(None, [
+            (blog.get("subDescription") or "").strip(),
+            (blog.get("description") or "").strip(),
+        ])).strip()
+        items.append({
+            "source_id": blog_id,
+            "dedupe_key": f"{blog_id}:{blog_datetime.isoformat()}",
+            "name": title,
+            "created_time": blog_datetime.isoformat(),
+            "metadata": {
                 "title": title,
-                "content": full_text if full_text else "No content available."
-            })
-            processed_titles.append(f"[Text] {title}")
+                "content": content,
+                "pdf_url": (blog.get("document") or "").strip(),
+                "updated_time": blog_datetime.isoformat(),
+            },
+        })
 
-        # Track the absolute newest date boundary encountered
-        if blog_datetime > newest_timestamp:
-            newest_timestamp = blog_datetime
+    try:
+        queued = _add_sync_job_items(job_id, "blogs", items)
+        db_fs.collection("system_config").document("blog_sync").set({
+            "last_sync_time": newest_timestamp.isoformat(),
+            "execution_ran_at": _sync_timestamp(),
+        }, merge=True)
+    except Exception:
+        logger.exception("blogs_sync: unable to persist discovered blog items")
+        raise HTTPException(status_code=503, detail="Unable to queue blog sync items.")
 
-    # Process all text-based items collectively if any were bundled
-    if raw_text_docs:
-        chunks = rag.ingest_raw_documents(raw_text_docs)
-        total_chunks += chunks
-
-    # 4. Save and commit index vector adjustments if changes occurred
-    if total_chunks > 0:
-        _save_and_sync(rag)
-
-    # 5. Flush state progress timestamp to Firestore
-    if project:
-        try:
-            db_fs = _firestore_client()
-            db_fs.collection("system_config").document("blog_sync").set(
-                {
-                    "last_sync_time": newest_timestamp.isoformat(),
-                    "execution_ran_at": datetime.now(timezone.utc).isoformat()
-                }, 
-                merge=True
-            )
-        except Exception as exc:
-            logger.warning("blogs_sync: Firestore checkpoint save failed: %s", exc)
-
+    _wake_sync_worker()
     return {
-        "synced": len(processed_titles),
-        "chunks_stored": total_chunks,
-        "processed_items": processed_titles
+        "job_id": job_id,
+        "queued": queued,
+        "discovered": len(new_blogs),
+        "last_sync_time": last_sync_time,
+        "next_sync_after": newest_timestamp.isoformat(),
     }

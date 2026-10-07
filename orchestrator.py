@@ -297,12 +297,28 @@ class RAGOrchestrator:
 
         return self._store_docs(docs)
 
+    def ingest_file(
+        self,
+        file_path: str,
+        section: str = "general",
+        source_url: Optional[str] = None,
+    ) -> int:
+        """Ingest one supported local file using an optional stable source URL."""
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"Not a file: {file_path}")
+        if path.suffix.lower() not in _ALL_SUPPORTED:
+            raise ValueError(f"Unsupported file type: {path.suffix}")
+
+        doc = self._process_local_file(path, section, source_url=source_url)
+        return self._store_docs([doc] if doc else [])
+
     def _process_local_file(
-        self, file_path: Path, section: str
+        self, file_path: Path, section: str, source_url: Optional[str] = None,
     ) -> Optional[ScrapedDocument]:
         """Convert one local file into a ScrapedDocument."""
         suffix = file_path.suffix.lower()
-        url = f"file://{file_path}"
+        url = source_url or f"file://{file_path}"
 
         # ── Plain text / markdown / HTML ─────────────────────────────
         if suffix in _TEXT_EXTENSIONS:
