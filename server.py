@@ -902,41 +902,42 @@ def _recover_stale_sync_items(job_id: str) -> int:
 def _recover_empty_index_failures() -> int:
     db_fs = _sync_jobs_client()
     recovered = 0
-    for item_doc in db_fs.collection_group("items").where(
-        "status", "==", _SYNC_ITEM_FAILED
-    ).stream():
-        item = item_doc.to_dict()
-        if not str(item.get("error") or "").startswith(_EMPTY_INDEX_ERROR_PREFIX):
-            continue
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).stream():
+        job_ref = job_doc.reference
+        for item_doc in job_ref.collection("items").stream():
+            item = item_doc.to_dict() or {}
+            if item.get("status") != _SYNC_ITEM_FAILED:
+                continue
+            if not str(item.get("error") or "").startswith(_EMPTY_INDEX_ERROR_PREFIX):
+                continue
 
-        now = _sync_timestamp()
-        item_doc.reference.update({
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "next_attempt_at": None,
-            "lease_expires_at": None,
-            "started_at": None,
-            "completed_at": None,
-            "updated_at": now,
-            "error": None,
-            "worker_id": None,
-            "claim_token": None,
-        })
-        _sync_source_item_reference(
-            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-        ).set({
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "updated_at": now,
-            "error": None,
-        }, merge=True)
-        job_ref = item_doc.reference.parent.parent
-        job_ref.set({
-            "status": "queued",
-            "completed_at": None,
-            "updated_at": now,
-        }, merge=True)
-        recovered += 1
+            now = _sync_timestamp()
+            item_doc.reference.update({
+                "status": _SYNC_ITEM_PENDING,
+                "attempts": 0,
+                "next_attempt_at": None,
+                "lease_expires_at": None,
+                "started_at": None,
+                "completed_at": None,
+                "updated_at": now,
+                "error": None,
+                "worker_id": None,
+                "claim_token": None,
+            })
+            _sync_source_item_reference(
+                db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+            ).set({
+                "status": _SYNC_ITEM_PENDING,
+                "attempts": 0,
+                "updated_at": now,
+                "error": None,
+            }, merge=True)
+            job_ref.set({
+                "status": "queued",
+                "completed_at": None,
+                "updated_at": now,
+            }, merge=True)
+            recovered += 1
     return recovered
 
 
@@ -960,7 +961,7 @@ def _pause_sync_job(job_id: str) -> dict:
     reset_items = 0
     for item_doc in job_ref.collection("items").stream():
         item = item_doc.to_dict() or {}
-        if item.get("status") not in {_SYNC_ITEM_PROCESSING, _SYNC_ITEM_FAILED}:
+        if item.get("status") == _SYNC_ITEM_COMPLETED:
             continue
         item_doc.reference.update({
             "status": _SYNC_ITEM_PENDING,
