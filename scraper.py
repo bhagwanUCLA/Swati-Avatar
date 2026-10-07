@@ -28,6 +28,7 @@ import os
 import re
 import tempfile
 import subprocess
+import shutil
 import time
 
 from copy import copy
@@ -901,6 +902,76 @@ class PortfolioScraper:
 # Gemini file extraction  (module-level — upload → generate → delete)
 # ---------------------------------------------------------------------------
 
+_GEMINI_AUDIO_SEGMENT_SECONDS = 55 * 60
+_AUDIO_FILE_SUFFIXES = {
+    ".mp4a", ".m4a", ".wav", ".mp3", ".aiff", ".ogg", ".flac",
+}
+
+
+def _audio_duration_seconds(file_path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
+
+
+def _extract_uploaded_gemini_file(
+    gemini_client,
+    model: str,
+    file_path: str,
+    source_url: str,
+    prompt: str,
+) -> str:
+    uploaded = None
+    try:
+        logger.info("  [Gemini file] uploading %s", source_url)
+        uploaded = gemini_client.files.upload(file=file_path)
+
+        while True:
+            file_info = gemini_client.files.get(name=uploaded.name)
+            state_str = str(file_info.state).upper()
+            if "PROCESSING" in state_str:
+                logger.info("  [Gemini file] Status: %s. Retrying in 5 seconds...", state_str)
+                time.sleep(5)
+            elif "FAILED" in state_str:
+                logger.error("  [Gemini file] File processing failed for %s", source_url)
+                return ""
+            else:
+                break
+
+        try:
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=[prompt, uploaded],
+            )
+            return getattr(response, "text", "") or ""
+        except Exception as exc:
+            logger.warning("generate_content(parts=…) failed; trying fallback: %s", exc)
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=[uploaded, prompt],
+                )
+                return getattr(response, "text", "") or ""
+            except Exception as fallback_exc:
+                logger.error("Gemini generate_content failed for %s: %s", source_url, fallback_exc)
+                return ""
+    finally:
+        try:
+            if uploaded and getattr(uploaded, "name", None) and hasattr(gemini_client.files, "delete"):
+                gemini_client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
 def extract_file_with_gemini(
     gemini_client,
     model: str,
@@ -925,7 +996,7 @@ def extract_file_with_gemini(
 
     tmp_path: Optional[str] = None
     mp3_path: Optional[str] = None
-    uploaded = None
+    segment_dir: Optional[str] = None
     try:
         suffix = ""
         if filename and "." in filename:
@@ -938,45 +1009,9 @@ def extract_file_with_gemini(
 
         with open(tmp_path, "wb") as fh:
             fh.write(file_bytes)
-        # Convert mp4a / m4a / mp4 audio to mp3 before uploading
-        if suffix in {".mp4a", ".m4a"}:
-            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-i", tmp_path,
-                    "-vn",
-                    "-codec:a", "libmp3lame",
-                    "-q:a", "2",
-                    mp3_path,
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-            logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
-            uploaded = gemini_client.files.upload(file=mp3_path)
-        else:
-            logger.info("  [Gemini file] uploading %s (%d KB)", source_url, len(file_bytes) // 1024)
-            uploaded = gemini_client.files.upload(file=tmp_path)
-
-        while True:
-            file_info = gemini_client.files.get(name=uploaded.name)
-            state_str = str(file_info.state).upper()
-            if "PROCESSING" in state_str:
-                logger.info("  [Gemini file] Status: %s. Retrying in 5 seconds...", state_str)
-                time.sleep(5)
-            elif "FAILED" in state_str:
-                logger.error("  [Gemini file] File processing failed for %s", source_url)
-                return fallback_title, ""
-            else:
-                break
-
-        ext       = (filename or source_url or "").lower().split("?")[0]
+        ext = (filename or source_url or "").lower().split("?")[0]
         mime_type = mime_hint or ""
+        is_audio = mime_type.startswith("audio/") or ext.endswith(tuple(_AUDIO_FILE_SUFFIXES))
 
         if ext.endswith(".pdf") or (mime_hint and "pdf" in mime_hint):
             mime_type = "application/pdf"
@@ -1027,37 +1062,77 @@ def extract_file_with_gemini(
                 "<full extracted content — preserve headings, paragraphs, lists and tables>"
             )
 
-        raw_text = ""
-        try:
-            logger.info(" %s, %s, %s", filename, ext, mime_type)
-            response = gemini_client.models.generate_content(
-                model=model,
-                contents=[prompt, uploaded],
+        upload_path = tmp_path
+        # Convert mp4a / m4a audio to mp3 before uploading or splitting.
+        if suffix in {".mp4a", ".m4a"}:
+            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", tmp_path,
+                    "-vn",
+                    "-codec:a", "libmp3lame",
+                    "-q:a", "2",
+                    mp3_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            raw_text = getattr(response, "text", "") or ""
-        except Exception as exc:
-            logger.warning("generate_content(parts=…) failed; trying fallback: %s", exc)
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=[uploaded, prompt],
+            upload_path = mp3_path
+
+        upload_paths = [upload_path]
+        if is_audio and _audio_duration_seconds(upload_path) > _GEMINI_AUDIO_SEGMENT_SECONDS:
+            segment_dir = tempfile.mkdtemp(prefix="gemini-audio-")
+            segment_pattern = os.path.join(segment_dir, "segment_%03d.mp3")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", upload_path,
+                    "-vn", "-codec:a", "libmp3lame", "-q:a", "2",
+                    "-f", "segment", "-segment_time", str(_GEMINI_AUDIO_SEGMENT_SECONDS),
+                    "-reset_timestamps", "1", segment_pattern,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            upload_paths = sorted(
+                os.path.join(segment_dir, name)
+                for name in os.listdir(segment_dir)
+                if name.endswith(".mp3")
+            )
+            if not upload_paths:
+                raise RuntimeError("ffmpeg produced no audio segments.")
+
+        extracted_parts = []
+        for part_number, part_path in enumerate(upload_paths, start=1):
+            part_prompt = prompt
+            if len(upload_paths) > 1:
+                part_prompt += (
+                    f"\n\nThis is part {part_number} of {len(upload_paths)} of one audio recording. "
+                    "Extract only the content in this part."
                 )
-                raw_text = getattr(response, "text", "") or ""
-            except Exception as exc2:
-                logger.error("Gemini generate_content failed for %s: %s", source_url, exc2)
+            raw_text = _extract_uploaded_gemini_file(
+                gemini_client, model, part_path, source_url, part_prompt,
+            )
+            if not raw_text:
+                return fallback_title, ""
+            title, content = _split_gemini_title(raw_text, fallback=fallback_title)
+            content = _clean_text(content)
+            if not content:
+                return fallback_title, ""
+            extracted_parts.append((title, content))
 
-        # Best-effort delete uploaded file
-        try:
-            if getattr(uploaded, "name", None) and hasattr(gemini_client.files, "delete"):
-                gemini_client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
-
-        if not raw_text:
-            return fallback_title, ""
-
-        title, content = _split_gemini_title(raw_text, fallback=fallback_title)
-        return title, _clean_text(content)
+        title = next((part_title for part_title, _ in extracted_parts if part_title), fallback_title)
+        if len(extracted_parts) == 1:
+            return title, extracted_parts[0][1]
+        content = "\n\n".join(
+            f"## Audio part {part_number} of {len(extracted_parts)}\n\n{part_content}"
+            for part_number, (_, part_content) in enumerate(extracted_parts, start=1)
+        )
+        return title, content
 
     except Exception as exc:
         logger.error("Gemini file extraction failed [%s]: %s", source_url, exc)
@@ -1071,6 +1146,11 @@ def extract_file_with_gemini(
         if mp3_path and os.path.exists(mp3_path):
             try:
                 os.remove(mp3_path)
+            except Exception:
+                pass
+        if segment_dir and os.path.isdir(segment_dir):
+            try:
+                shutil.rmtree(segment_dir)
             except Exception:
                 pass
 
