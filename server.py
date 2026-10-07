@@ -717,6 +717,11 @@ def _claim_next_sync_item(job_id: str) -> Optional[dict]:
 
         @firestore.transactional
         def claim_item(transaction):
+            job_snapshot = job_ref.get(transaction=transaction)
+            job = job_snapshot.to_dict() if job_snapshot.exists else None
+            if not job or job.get("status") not in {"queued", "running", "discovering"}:
+                return None
+
             item_snapshot = candidate.reference.get(transaction=transaction)
             if not item_snapshot.exists:
                 return None
@@ -943,7 +948,7 @@ def _pause_sync_job(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Sync job not found.")
 
     current_status = (job_doc.to_dict() or {}).get("status")
-    if current_status in {"completed", "completed_with_failures"}:
+    if current_status == "completed":
         raise HTTPException(status_code=409, detail="Completed jobs cannot be paused.")
 
     now = _sync_timestamp()
@@ -952,38 +957,11 @@ def _pause_sync_job(job_id: str) -> dict:
         "paused_at": now,
         "updated_at": now,
     }, merge=True)
-    return _sync_job_status(job_id)
-
-
-def _restart_sync_job(job_id: str) -> dict:
-    db_fs = _sync_jobs_client()
-    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    job_doc = job_ref.get()
-    if not job_doc.exists:
-        raise HTTPException(status_code=404, detail="Sync job not found.")
-
-    job = job_doc.to_dict() or {}
-    if job.get("status") != _SYNC_JOB_PAUSED:
-        raise HTTPException(status_code=409, detail="Pause the sync job before restarting it.")
-
-    items = list(job_ref.collection("items").stream())
-    processing_count = sum(
-        1 for item_doc in items
-        if (item_doc.to_dict() or {}).get("status") == _SYNC_ITEM_PROCESSING
-    )
-    if processing_count:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Wait for {processing_count} active item(s) to finish before restarting.",
-        )
-
-    now = _sync_timestamp()
-    requeued = 0
-    for item_doc in items:
+    reset_items = 0
+    for item_doc in job_ref.collection("items").stream():
         item = item_doc.to_dict() or {}
-        if item.get("status") != _SYNC_ITEM_FAILED:
+        if item.get("status") not in {_SYNC_ITEM_PROCESSING, _SYNC_ITEM_FAILED}:
             continue
-
         item_doc.reference.update({
             "status": _SYNC_ITEM_PENDING,
             "attempts": 0,
@@ -1004,14 +982,28 @@ def _restart_sync_job(job_id: str) -> dict:
             "updated_at": now,
             "error": None,
         }, merge=True)
-        requeued += 1
+        reset_items += 1
+    job_ref.set({"paused_reset_items": reset_items}, merge=True)
+    return _sync_job_status(job_id)
 
+
+def _restart_sync_job(job_id: str) -> dict:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job_doc = job_ref.get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    job = job_doc.to_dict() or {}
+    if job.get("status") != _SYNC_JOB_PAUSED:
+        raise HTTPException(status_code=409, detail="Pause the sync job before restarting it.")
+
+    now = _sync_timestamp()
     job_ref.set({
         "status": "queued",
         "completed_at": None,
         "paused_at": None,
         "restarted_at": now,
-        "restarted_failed_items": requeued,
         "updated_at": now,
     }, merge=True)
     _wake_sync_worker()
@@ -2344,13 +2336,13 @@ def get_sync_job(
 
 @app.post("/sync-jobs/{job_id}/pause")
 def pause_sync_job(job_id: str, _: AdminDep):
-    """Prevent the worker from claiming additional items for a sync job."""
+    """Reset unfinished work to pending and stop new claims for a sync job."""
     return _pause_sync_job(job_id)
 
 
 @app.post("/sync-jobs/{job_id}/restart")
 def restart_sync_job(job_id: str, _: AdminDep):
-    """Resume a paused job and requeue only its failed items."""
+    """Resume a paused job after pause has reset its unfinished items."""
     return _restart_sync_job(job_id)
 
 
