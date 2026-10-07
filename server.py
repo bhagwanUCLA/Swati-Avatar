@@ -1050,9 +1050,12 @@ def _claim_next_sync_work() -> Optional[tuple[str, dict]]:
     db_fs = _sync_jobs_client()
     for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).order_by("created_at").stream():
         job = job_doc.to_dict()
-        if job.get("status") not in {"queued", "running", "discovering"}:
+        job_status = job.get("status")
+        if job_status not in {"queued", "running", "discovering", _SYNC_JOB_PAUSED}:
             continue
         _recover_stale_sync_items(job_doc.id)
+        if job_status == _SYNC_JOB_PAUSED:
+            continue
         item = _claim_next_sync_item(job_doc.id)
         if item:
             job_doc.reference.set({"status": "running", "updated_at": _sync_timestamp()}, merge=True)
