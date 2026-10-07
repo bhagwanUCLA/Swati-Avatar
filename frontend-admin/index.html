@@ -772,7 +772,7 @@ async function doLogin() {
     sessionStorage.setItem('admin_token', data.access_token);
     errEl.textContent = '';
     document.getElementById('login-overlay').style.display = 'none';
-    loadIndex();
+    onPromptTabOpen();
   } catch(e) {
     errEl.textContent = 'Could not connect to server.';
   }
@@ -811,7 +811,7 @@ async function doSetup() {
     const loginData = await loginRes.json();
     sessionStorage.setItem('admin_token', loginData.access_token);
     document.getElementById('login-overlay').style.display = 'none';
-    loadIndex();
+    onPromptTabOpen();
   } catch (err) {
     errEl.textContent = err.message;
   }
@@ -841,7 +841,7 @@ async function initAuth() {
       // Local dev bypass
       if (data.bypass) {
         document.getElementById('login-overlay').style.display = 'none';
-        loadIndex();
+        onPromptTabOpen();
         return;
       }
 
@@ -864,7 +864,7 @@ async function initAuth() {
     document.getElementById('setup-box').style.display = 'none';
   } else {
     document.getElementById('login-overlay').style.display = 'none';
-    loadIndex();
+    onPromptTabOpen();
   }
 }
 window.addEventListener('DOMContentLoaded', initAuth);

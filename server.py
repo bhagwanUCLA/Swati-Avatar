@@ -1718,14 +1718,26 @@ async def youtube_notify(request: Request):
 
     root = ET.fromstring(body)
     ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
+    videos_processed = 0
+    errors = []
+
     for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
         vid_el = entry.find("yt:videoId", ns)
         if vid_el is not None and vid_el.text:
             url = f"https://www.youtube.com/watch?v={vid_el.text.strip()}"
-            logger.info("PubSubHubbub: new video detected %s", url)
-            rag = _get_rag()
-            rag.ingest_videos([url])
-            _save_and_sync(rag)
+            try:
+                logger.info("PubSubHubbub: new video detected %s", url)
+                rag = _get_rag()
+                rag.ingest_videos([url])
+                _save_and_sync(rag)
+                videos_processed += 1
+            except Exception as e:
+                logger.error("PubSubHubbub: failed to ingest video %s: %s", url, e)
+                errors.append({"url": url, "error": str(e)})
+
+    if errors:
+        logger.warning("PubSubHubbub: %d video(s) failed to ingest out of %d",
+                      len(errors), videos_processed + len(errors))
 
     return Response(status_code=204)
 
@@ -1901,7 +1913,7 @@ def gdrive_sync():
     # Build query for files
     query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false"
     if last_sync_time:
-        query += f" and createdTime > '{last_sync_time}'"
+        query += f" and createdTime >= '{last_sync_time}'"
 
     # List files (with pagination for folders with >100 files)
     all_files = []
@@ -2069,7 +2081,7 @@ def blogs_sync():
     rag = _get_rag()
     total_chunks = 0
     processed_titles = []
-    newest_timestamp = last_sync_datetime or datetime.fromisoformat("1970-01-01T00:00:00")
+    newest_timestamp = last_sync_datetime or datetime(1970, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
     # Arrays to isolate batch workloads
     raw_text_docs = []
@@ -2108,13 +2120,13 @@ def blogs_sync():
             logger.info("blogs_sync: processing via Raw Text pipeline -> %s", title)
             sub_desc = blog.get("subDescription") or ""
             desc = blog.get("description") or ""
-            
+
             # Combine the body text components natively
             full_text = f"{sub_desc}\n\n{desc}".strip()
-            
+
             raw_text_docs.append({
                 "title": title,
-                "text": full_text if full_text else "No content available."
+                "content": full_text if full_text else "No content available."
             })
             processed_titles.append(f"[Text] {title}")
 
