@@ -138,10 +138,15 @@ class RAGOrchestrator:
             min_tokens=min_tokens,
         )
 
+        index_path = Path(index_dir)
+        has_saved_index = (
+            (index_path / "faiss.index").is_file()
+            and (index_path / "metadata.pkl").is_file()
+        )
         self.db = FAISSDatabase(
             model_name=hf_model_name,
             gemini_api_key=gemini_api_key,
-            index_path=index_dir if os.path.exists(index_dir) else None,
+            index_path=index_dir if has_saved_index else None,
             device=device,
         )
 

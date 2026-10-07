@@ -47,6 +47,7 @@ import logging
 import os
 import secrets
 import queue as _sync_queue
+import socket
 import threading
 import uuid
 import xml.etree.ElementTree as ET
@@ -457,6 +458,7 @@ _SYNC_ITEM_PENDING = "pending"
 _SYNC_ITEM_PROCESSING = "processing"
 _SYNC_ITEM_COMPLETED = "completed"
 _SYNC_ITEM_FAILED = "failed"
+_SYNC_JOB_PAUSED = "paused"
 _SYNC_ITEM_STATUSES = {
     _SYNC_ITEM_PENDING,
     _SYNC_ITEM_PROCESSING,
@@ -468,6 +470,8 @@ _SYNC_MAX_ATTEMPTS = 3
 _SYNC_RETRY_BASE_SECONDS = 30
 _SYNC_RETRY_MAX_SECONDS = 900
 _SYNC_WORKER_POLL_SECONDS = 15
+_EMPTY_INDEX_ERROR_PREFIX = "No saved index found in"
+_SYNC_WORKER_INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 _sync_worker_task: Optional[asyncio.Task] = None
 _sync_worker_wakeup: Optional[asyncio.Event] = None
 _index_write_lock = threading.RLock()
@@ -701,104 +705,166 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
 
 
 def _claim_next_sync_item(job_id: str) -> Optional[dict]:
+    from google.cloud import firestore
+
     db_fs = _sync_jobs_client()
     job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    now = datetime.now(timezone.utc)
-    item_doc = None
-    item = None
     for candidate in job_ref.collection("items").order_by("created_at").stream():
         candidate_item = candidate.to_dict()
         if candidate_item.get("status") != _SYNC_ITEM_PENDING:
             continue
-        next_attempt_at = candidate_item.get("next_attempt_at")
-        if next_attempt_at:
-            try:
-                next_attempt = datetime.fromisoformat(next_attempt_at.replace("Z", "+00:00"))
-            except ValueError:
-                next_attempt = now
-            if next_attempt > now:
-                continue
-        item_doc = candidate
-        item = candidate_item
-        break
+        claim_token = uuid.uuid4().hex
 
-    if item_doc is None or item is None:
-        return None
+        @firestore.transactional
+        def claim_item(transaction):
+            item_snapshot = candidate.reference.get(transaction=transaction)
+            if not item_snapshot.exists:
+                return None
+            item = item_snapshot.to_dict() or {}
+            if item.get("status") != _SYNC_ITEM_PENDING:
+                return None
 
-    item_doc.reference.update({
-        "status": _SYNC_ITEM_PROCESSING,
-        "attempts": int(item.get("attempts", 0)) + 1,
-        "started_at": now.isoformat(),
-        "next_attempt_at": None,
-        "lease_expires_at": (now + timedelta(seconds=_SYNC_PROCESSING_LEASE_SECONDS)).isoformat(),
-        "updated_at": now.isoformat(),
-        "error": None,
-    })
-    _sync_source_item_reference(
-        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-    ).set({
-        "status": _SYNC_ITEM_PROCESSING,
-        "attempts": int(item.get("attempts", 0)) + 1,
-        "updated_at": now.isoformat(),
-    }, merge=True)
-    item["id"] = item_doc.id
-    item["attempts"] = int(item.get("attempts", 0)) + 1
-    return item
+            now = datetime.now(timezone.utc)
+            next_attempt_at = item.get("next_attempt_at")
+            if next_attempt_at:
+                try:
+                    next_attempt = _parse_sync_datetime(next_attempt_at)
+                except ValueError:
+                    next_attempt = now
+                if next_attempt > now:
+                    return None
+
+            attempts = int(item.get("attempts", 0)) + 1
+            now_text = now.isoformat()
+            transaction.update(candidate.reference, {
+                "status": _SYNC_ITEM_PROCESSING,
+                "attempts": attempts,
+                "started_at": now_text,
+                "next_attempt_at": None,
+                "lease_expires_at": (now + timedelta(seconds=_SYNC_PROCESSING_LEASE_SECONDS)).isoformat(),
+                "updated_at": now_text,
+                "error": None,
+                "worker_id": _SYNC_WORKER_INSTANCE_ID,
+                "claim_token": claim_token,
+            })
+            source_ref = _sync_source_item_reference(
+                db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+            )
+            transaction.set(source_ref, {
+                "status": _SYNC_ITEM_PROCESSING,
+                "attempts": attempts,
+                "worker_id": _SYNC_WORKER_INSTANCE_ID,
+                "updated_at": now_text,
+            }, merge=True)
+            item["id"] = candidate.id
+            item["attempts"] = attempts
+            item["worker_id"] = _SYNC_WORKER_INSTANCE_ID
+            item["claim_token"] = claim_token
+            return item
+
+        item = claim_item(db_fs.transaction())
+        if item:
+            return item
+    return None
 
 
-def _complete_sync_item(job_id: str, item_id: str, chunks_stored: int) -> None:
+def _complete_sync_item(
+    job_id: str,
+    item_id: str,
+    chunks_stored: int,
+    claim_token: Optional[str],
+) -> bool:
+    from google.cloud import firestore
+
     now = _sync_timestamp()
     db_fs = _sync_jobs_client()
     item_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).collection("items").document(item_id)
-    item = item_ref.get().to_dict() or {}
-    item_ref.update({
-        "status": _SYNC_ITEM_COMPLETED,
-        "chunks_stored": chunks_stored,
-        "completed_at": now,
-        "lease_expires_at": None,
-        "updated_at": now,
-        "error": None,
-    })
-    _sync_source_item_reference(
-        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-    ).set({
-        "status": _SYNC_ITEM_COMPLETED,
-        "chunks_stored": chunks_stored,
-        "completed_at": now,
-        "updated_at": now,
-        "error": None,
-    }, merge=True)
+
+    @firestore.transactional
+    def complete_item(transaction):
+        item_snapshot = item_ref.get(transaction=transaction)
+        item = item_snapshot.to_dict() if item_snapshot.exists else None
+        if not item or item.get("status") != _SYNC_ITEM_PROCESSING:
+            return False
+        if item.get("claim_token") != claim_token:
+            return False
+
+        transaction.update(item_ref, {
+            "status": _SYNC_ITEM_COMPLETED,
+            "chunks_stored": chunks_stored,
+            "completed_at": now,
+            "lease_expires_at": None,
+            "claim_token": None,
+            "updated_at": now,
+            "error": None,
+        })
+        source_ref = _sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        )
+        transaction.set(source_ref, {
+            "status": _SYNC_ITEM_COMPLETED,
+            "chunks_stored": chunks_stored,
+            "completed_at": now,
+            "updated_at": now,
+            "error": None,
+        }, merge=True)
+        return True
+
+    return complete_item(db_fs.transaction())
 
 
-def _fail_sync_item(job_id: str, item_id: str, error: str, retryable: bool = True) -> None:
+def _fail_sync_item(
+    job_id: str,
+    item_id: str,
+    error: str,
+    retryable: bool = True,
+    claim_token: Optional[str] = None,
+) -> bool:
+    from google.cloud import firestore
+
     db_fs = _sync_jobs_client()
     item_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).collection("items").document(item_id)
-    item = item_ref.get().to_dict() or {}
-    attempts = int(item.get("attempts", 0))
-    next_status = _SYNC_ITEM_PENDING if retryable and attempts < _SYNC_MAX_ATTEMPTS else _SYNC_ITEM_FAILED
-    retry_delay = min(
-        _SYNC_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)),
-        _SYNC_RETRY_MAX_SECONDS,
-    )
-    next_attempt_at = (
-        (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
-        if next_status == _SYNC_ITEM_PENDING else None
-    )
-    item_ref.update({
-        "status": next_status,
-        "lease_expires_at": None,
-        "next_attempt_at": next_attempt_at,
-        "updated_at": _sync_timestamp(),
-        "error": error[:2000],
-    })
-    _sync_source_item_reference(
-        db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-    ).set({
-        "status": next_status,
-        "attempts": attempts,
-        "updated_at": _sync_timestamp(),
-        "error": error[:2000],
-    }, merge=True)
+
+    @firestore.transactional
+    def fail_item(transaction):
+        item_snapshot = item_ref.get(transaction=transaction)
+        item = item_snapshot.to_dict() if item_snapshot.exists else None
+        if not item or item.get("status") != _SYNC_ITEM_PROCESSING:
+            return False
+        if item.get("claim_token") != claim_token:
+            return False
+
+        attempts = int(item.get("attempts", 0))
+        next_status = _SYNC_ITEM_PENDING if retryable and attempts < _SYNC_MAX_ATTEMPTS else _SYNC_ITEM_FAILED
+        retry_delay = min(
+            _SYNC_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)),
+            _SYNC_RETRY_MAX_SECONDS,
+        )
+        next_attempt_at = (
+            (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat()
+            if next_status == _SYNC_ITEM_PENDING else None
+        )
+        now = _sync_timestamp()
+        transaction.update(item_ref, {
+            "status": next_status,
+            "lease_expires_at": None,
+            "next_attempt_at": next_attempt_at,
+            "claim_token": None,
+            "updated_at": now,
+            "error": error[:2000],
+        })
+        source_ref = _sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        )
+        transaction.set(source_ref, {
+            "status": next_status,
+            "attempts": attempts,
+            "updated_at": now,
+            "error": error[:2000],
+        }, merge=True)
+        return True
+
+    return fail_item(db_fs.transaction())
 
 
 def _recover_stale_sync_items(job_id: str) -> int:
@@ -818,13 +884,145 @@ def _recover_stale_sync_items(job_id: str) -> int:
             lease_expiry = stale_before
         if lease_expiry > stale_before:
             continue
-        _fail_sync_item(job_id, item_doc.id, "Processing lease expired after an interrupted worker.")
+        _fail_sync_item(
+            job_id,
+            item_doc.id,
+            "Processing lease expired after an interrupted worker.",
+            claim_token=item.get("claim_token"),
+        )
         recovered += 1
     return recovered
 
 
+def _recover_empty_index_failures() -> int:
+    db_fs = _sync_jobs_client()
+    recovered = 0
+    for item_doc in db_fs.collection_group("items").where(
+        "status", "==", _SYNC_ITEM_FAILED
+    ).stream():
+        item = item_doc.to_dict()
+        if not str(item.get("error") or "").startswith(_EMPTY_INDEX_ERROR_PREFIX):
+            continue
+
+        now = _sync_timestamp()
+        item_doc.reference.update({
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "next_attempt_at": None,
+            "lease_expires_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now,
+            "error": None,
+            "worker_id": None,
+            "claim_token": None,
+        })
+        _sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        ).set({
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "updated_at": now,
+            "error": None,
+        }, merge=True)
+        job_ref = item_doc.reference.parent.parent
+        job_ref.set({
+            "status": "queued",
+            "completed_at": None,
+            "updated_at": now,
+        }, merge=True)
+        recovered += 1
+    return recovered
+
+
+def _pause_sync_job(job_id: str) -> dict:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job_doc = job_ref.get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    current_status = (job_doc.to_dict() or {}).get("status")
+    if current_status in {"completed", "completed_with_failures"}:
+        raise HTTPException(status_code=409, detail="Completed jobs cannot be paused.")
+
+    now = _sync_timestamp()
+    job_ref.set({
+        "status": _SYNC_JOB_PAUSED,
+        "paused_at": now,
+        "updated_at": now,
+    }, merge=True)
+    return _sync_job_status(job_id)
+
+
+def _restart_sync_job(job_id: str) -> dict:
+    db_fs = _sync_jobs_client()
+    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job_doc = job_ref.get()
+    if not job_doc.exists:
+        raise HTTPException(status_code=404, detail="Sync job not found.")
+
+    job = job_doc.to_dict() or {}
+    if job.get("status") != _SYNC_JOB_PAUSED:
+        raise HTTPException(status_code=409, detail="Pause the sync job before restarting it.")
+
+    items = list(job_ref.collection("items").stream())
+    processing_count = sum(
+        1 for item_doc in items
+        if (item_doc.to_dict() or {}).get("status") == _SYNC_ITEM_PROCESSING
+    )
+    if processing_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Wait for {processing_count} active item(s) to finish before restarting.",
+        )
+
+    now = _sync_timestamp()
+    requeued = 0
+    for item_doc in items:
+        item = item_doc.to_dict() or {}
+        if item.get("status") != _SYNC_ITEM_FAILED:
+            continue
+
+        item_doc.reference.update({
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "next_attempt_at": None,
+            "lease_expires_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now,
+            "error": None,
+            "worker_id": None,
+            "claim_token": None,
+        })
+        _sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        ).set({
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "updated_at": now,
+            "error": None,
+        }, merge=True)
+        requeued += 1
+
+    job_ref.set({
+        "status": "queued",
+        "completed_at": None,
+        "paused_at": None,
+        "restarted_at": now,
+        "restarted_failed_items": requeued,
+        "updated_at": now,
+    }, merge=True)
+    _wake_sync_worker()
+    return _sync_job_status(job_id)
+
+
 def _refresh_sync_job_status(job_id: str) -> None:
     job_ref = _sync_jobs_client().collection(_SYNC_JOBS_COLLECTION).document(job_id)
+    job = job_ref.get().to_dict() or {}
+    if job.get("status") == _SYNC_JOB_PAUSED:
+        return
     statuses = [
         item_doc.to_dict().get("status")
         for item_doc in job_ref.collection("items").stream()
@@ -1006,6 +1204,10 @@ async def _sync_worker_loop() -> None:
                 await _wait_for_sync_worker_wakeup()
                 continue
 
+            recovered = await asyncio.to_thread(_recover_empty_index_failures)
+            if recovered:
+                logger.warning("Worker: requeued %d item(s) after empty-index recovery.", recovered)
+
             work = await asyncio.to_thread(_claim_next_sync_work)
             if not work:
                 await _wait_for_sync_worker_wakeup()
@@ -1014,10 +1216,27 @@ async def _sync_worker_loop() -> None:
             job_id, item = work
             try:
                 chunks_stored = await asyncio.to_thread(_process_sync_item, item)
-                await asyncio.to_thread(_complete_sync_item, job_id, item["id"], chunks_stored)
+                completed = await asyncio.to_thread(
+                    _complete_sync_item,
+                    job_id,
+                    item["id"],
+                    chunks_stored,
+                    item.get("claim_token"),
+                )
+                if not completed:
+                    logger.warning("Worker lost ownership before completing job=%s item=%s", job_id, item["id"])
             except Exception as exc:
                 logger.exception("Sync worker failed job=%s item=%s", job_id, item["id"])
-                await asyncio.to_thread(_fail_sync_item, job_id, item["id"], str(exc))
+                failed = await asyncio.to_thread(
+                    _fail_sync_item,
+                    job_id,
+                    item["id"],
+                    str(exc),
+                    True,
+                    item.get("claim_token"),
+                )
+                if not failed:
+                    logger.warning("Worker lost ownership before failing job=%s item=%s", job_id, item["id"])
             finally:
                 await asyncio.to_thread(_refresh_sync_job_status, job_id)
         except asyncio.CancelledError:
@@ -1499,6 +1718,13 @@ async def startup_event():
         logger.info("Startup: RAG index loaded and ready.")
     except Exception as exc:
         logger.error("Startup: RAG warm-up failed — first query will trigger lazy load. Error: %s", exc)
+
+    try:
+        recovered = await asyncio.to_thread(_recover_empty_index_failures)
+        if recovered:
+            logger.warning("Startup: requeued %d item(s) after empty-index recovery.", recovered)
+    except Exception as exc:
+        logger.error("Startup: empty-index recovery failed: %s", exc)
 
     _start_sync_worker()
 
@@ -2111,6 +2337,18 @@ def get_sync_job(
 ):
     """Return one auto-sync job, its status counts, and its items."""
     return _sync_job_status(job_id, item_limit, item_offset)
+
+
+@app.post("/sync-jobs/{job_id}/pause")
+def pause_sync_job(job_id: str, _: AdminDep):
+    """Prevent the worker from claiming additional items for a sync job."""
+    return _pause_sync_job(job_id)
+
+
+@app.post("/sync-jobs/{job_id}/restart")
+def restart_sync_job(job_id: str, _: AdminDep):
+    """Resume a paused job and requeue only its failed items."""
+    return _restart_sync_job(job_id)
 
 
 # ---------------------------------------------------------------------------
