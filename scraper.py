@@ -908,6 +908,10 @@ _AUDIO_FILE_SUFFIXES = {
 }
 
 
+class GeminiFileExtractionError(RuntimeError):
+    """A file-extraction failure that should be shown to ingestion callers."""
+
+
 def _audio_duration_seconds(file_path: str) -> float:
     result = subprocess.run(
         [
@@ -944,7 +948,7 @@ def _extract_uploaded_gemini_file(
                 time.sleep(5)
             elif "FAILED" in state_str:
                 logger.error("  [Gemini file] File processing failed for %s", source_url)
-                return ""
+                raise GeminiFileExtractionError("Gemini file processing reported FAILED.")
             else:
                 break
 
@@ -964,7 +968,10 @@ def _extract_uploaded_gemini_file(
                 return getattr(response, "text", "") or ""
             except Exception as fallback_exc:
                 logger.error("Gemini generate_content failed for %s: %s", source_url, fallback_exc)
-                return ""
+                raise GeminiFileExtractionError(
+                    f"Gemini generation failed after fallback: "
+                    f"{type(fallback_exc).__name__}: {fallback_exc}"
+                ) from fallback_exc
     finally:
         try:
             if uploaded and getattr(uploaded, "name", None) and hasattr(gemini_client.files, "delete"):
@@ -992,7 +999,7 @@ def extract_file_with_gemini(
     """
     if not gemini_client:
         logger.warning("Gemini client not configured; cannot extract file: %s", source_url)
-        return fallback_title, ""
+        raise GeminiFileExtractionError("Gemini client is not configured.")
 
     tmp_path: Optional[str] = None
     mp3_path: Optional[str] = None
@@ -1118,11 +1125,17 @@ def extract_file_with_gemini(
                 gemini_client, model, part_path, source_url, part_prompt,
             )
             if not raw_text:
-                return fallback_title, ""
+                raise GeminiFileExtractionError(
+                    f"Gemini returned an empty response for audio part "
+                    f"{part_number} of {len(upload_paths)}."
+                )
             title, content = _split_gemini_title(raw_text, fallback=fallback_title)
             content = _clean_text(content)
             if not content:
-                return fallback_title, ""
+                raise GeminiFileExtractionError(
+                    f"Gemini response contained no indexable text for audio part "
+                    f"{part_number} of {len(upload_paths)}."
+                )
             extracted_parts.append((title, content))
 
         title = next((part_title for part_title, _ in extracted_parts if part_title), fallback_title)
@@ -1134,9 +1147,13 @@ def extract_file_with_gemini(
         )
         return title, content
 
+    except GeminiFileExtractionError:
+        raise
     except Exception as exc:
         logger.error("Gemini file extraction failed [%s]: %s", source_url, exc)
-        return fallback_title, ""
+        raise GeminiFileExtractionError(
+            f"Gemini file extraction failed: {type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:

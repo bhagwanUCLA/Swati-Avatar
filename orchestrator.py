@@ -407,6 +407,9 @@ class RAGOrchestrator:
                     title or file_path.stem, section, url, content, "text"
                 )
             except Exception as exc:
+                from scraper import GeminiFileExtractionError
+                if isinstance(exc, GeminiFileExtractionError):
+                    raise
                 logger.warning("Failed to extract %s: %s", file_path, exc)
                 return None
 
