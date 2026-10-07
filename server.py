@@ -1908,6 +1908,18 @@ def gdrive_sync():
         logger.error(f"gdrive_sync: Failed to initialize Drive service: {e}")
         raise HTTPException(status_code=503, detail=f"Google Drive service unavailable: {e}")
 
+    try:
+        folder = drive_service.files().get(
+            fileId=GDRIVE_FOLDER_ID,
+            fields="id,name,mimeType",
+        ).execute()
+        folder_info = {"id": folder["id"], "name": folder.get("name")}
+        logger.info("gdrive_sync: folder_id=%s folder_name=%s",
+                    folder_info["id"], folder_info["name"])
+    except Exception as e:
+        logger.error("gdrive_sync: Failed to read Drive folder %s: %s", GDRIVE_FOLDER_ID, e)
+        raise HTTPException(status_code=502, detail=f"Google Drive folder unavailable: {e}")
+
     # Get last sync time
     last_sync_time = None
     project = os.environ.get('GOOGLE_CLOUD_PROJECT', '')
@@ -1963,6 +1975,7 @@ def gdrive_sync():
             "synced": 0,
             "message": "No new supported files since last sync",
             "last_sync_time": last_sync_time,
+            "folder": folder_info,
             "files_matched": len(all_files),
         }
 
@@ -2008,6 +2021,7 @@ def gdrive_sync():
                     "chunks_stored": 0,
                     "files": synced_names,
                     "last_sync_time": last_sync_time,
+                    "folder": folder_info,
                     "error": f"Ingestion failed: {str(e)}"
                 }
 
@@ -2022,6 +2036,7 @@ def gdrive_sync():
                 "chunks_stored": total_chunks,
                 "files": synced_names,
                 "last_sync_time": last_sync_time,
+                "folder": folder_info,
                 "error": f"GCS save failed: {str(e)}"
             }
         # Only save sync state AFTER successful GCS upload
@@ -2033,6 +2048,7 @@ def gdrive_sync():
         "chunks_stored": total_chunks,
         "files": synced_names,
         "last_sync_time": last_sync_time,
+        "folder": folder_info,
         "next_sync_after": max_ingested_time
     }
 
