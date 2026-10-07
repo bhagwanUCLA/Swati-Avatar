@@ -1895,7 +1895,7 @@ def onedrive_sync():
 @app.post("/gdrive/sync")
 def gdrive_sync():
     """
-    List files in the shared Google Drive folder, ingest any added/modified files
+    List files newly created in the shared Google Drive folder, ingest them,
     since the last sync, and update the last_sync_time in Firestore.
     Called weekly by Cloud Scheduler.
     """
@@ -1917,10 +1917,13 @@ def gdrive_sync():
         if sync_state:
             last_sync_time = sync_state.get('last_sync_time')
 
-    # Build query for files
+    logger.info("gdrive_sync: last_sync_time=%s", last_sync_time or "none")
+
+    # Build query for files. createdTime is the Drive creation time, so files
+    # uploaded directly into this folder after the checkpoint are included.
     query = f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false"
     if last_sync_time:
-        query += f" and createdTime >= '{last_sync_time}'"
+        query += f" and createdTime > '{last_sync_time}'"
 
     # List files (with pagination for folders with >100 files)
     all_files = []
@@ -1956,14 +1959,17 @@ def gdrive_sync():
     new_files = [f for f in all_files if f.get('mimeType') in supported_types]
 
     if not new_files:
-        return {"synced": 0, "message": "No new supported files since last sync"}
+        return {
+            "synced": 0,
+            "message": "No new supported files since last sync",
+            "last_sync_time": last_sync_time,
+            "files_matched": len(all_files),
+        }
 
     rag = _get_rag()
     total_chunks = 0
     synced_names = []
-    # Initialize max_ingested_time: use current time (no microseconds) if first sync, otherwise use last_sync_time
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat() + 'Z'
-    max_ingested_time = last_sync_time if last_sync_time else now_utc
+    max_ingested_time = last_sync_time
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for item in new_files:
@@ -1980,7 +1986,11 @@ def gdrive_sync():
                     f.write(file_bytes)
 
                 synced_names.append(file_name)
-                max_ingested_time = item['createdTime']
+                item_created_time = item.get('createdTime')
+                if item_created_time and (
+                    max_ingested_time is None or item_created_time > max_ingested_time
+                ):
+                    max_ingested_time = item_created_time
                 logger.info(f"gdrive_sync: downloaded {file_name}")
 
             except Exception as e:
@@ -1997,6 +2007,7 @@ def gdrive_sync():
                     "synced": len(synced_names),
                     "chunks_stored": 0,
                     "files": synced_names,
+                    "last_sync_time": last_sync_time,
                     "error": f"Ingestion failed: {str(e)}"
                 }
 
@@ -2010,6 +2021,7 @@ def gdrive_sync():
                 "synced": len(synced_names),
                 "chunks_stored": total_chunks,
                 "files": synced_names,
+                "last_sync_time": last_sync_time,
                 "error": f"GCS save failed: {str(e)}"
             }
         # Only save sync state AFTER successful GCS upload
@@ -2020,6 +2032,7 @@ def gdrive_sync():
         "synced": len(synced_names),
         "chunks_stored": total_chunks,
         "files": synced_names,
+        "last_sync_time": last_sync_time,
         "next_sync_after": max_ingested_time
     }
 
