@@ -1246,6 +1246,15 @@ def _serialized_index_mutation(handler):
     return wrapped
 
 
+def _serialized_index_recovery(handler):
+    """Serialize a verified recovery without requiring a previously healthy in-memory index."""
+    @functools.wraps(handler)
+    def wrapped(*args, **kwargs):
+        with _index_write_lock:
+            return handler(*args, **kwargs)
+    return wrapped
+
+
 def _process_gdrive_sync_item(item: dict) -> int:
     file_id = item["source_id"]
     file_name = Path(item.get("name") or file_id).name
@@ -2501,7 +2510,7 @@ def inspect_index_recovery(
 
 
 @app.post("/admin/index-recovery/merge")
-@_serialized_index_mutation
+@_serialized_index_recovery
 def merge_release_into_primary(body: ReleaseMergeRequest, _: AdminDep):
     """Merge one validated release into the primary GCS FAISS pair without re-ingesting source files."""
     if body.confirmation != "MERGE_RELEASE_INTO_PRIMARY":
@@ -2571,9 +2580,11 @@ def merge_release_into_primary(body: ReleaseMergeRequest, _: AdminDep):
             )
         _upload_index_to_gcs(bucket_name, str(merged_dir))
 
-    global _rag
+    global _rag, _index_storage_ready, _index_storage_error
     primary_db.save(_current_config["index_dir"])
     _rag = None
+    _index_storage_ready = True
+    _index_storage_error = None
     return {
         "merged": True,
         "release_id": release_id,
