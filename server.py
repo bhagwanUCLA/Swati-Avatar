@@ -47,6 +47,7 @@ import logging
 import os
 import secrets
 import queue as _sync_queue
+import re
 import socket
 import threading
 import uuid
@@ -69,6 +70,7 @@ import zipfile
 
 
 from orchestrator import RAGOrchestrator
+from database import FAISSDatabase
 from rag_query import RAG
 from dotenv import load_dotenv
 
@@ -107,6 +109,7 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 # ---------------------------------------------------------------------------
 
 _GCS_INDEX_FILES = ["faiss.index", "metadata.pkl"]
+_RELEASE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _gcs_client():
@@ -163,6 +166,159 @@ def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
     except Exception as exc:
         logger.error("GCS upload failed: %s", exc)
         raise RuntimeError(f"GCS index upload failed: {exc}") from exc
+
+
+def _validated_release_id(release_id: str) -> str:
+    if not _RELEASE_ID_PATTERN.fullmatch(release_id):
+        raise HTTPException(
+            status_code=400,
+            detail="release_id must be the 32-character hexadecimal ID returned by the inspection endpoint.",
+        )
+    return release_id
+
+
+def _resolve_current_release_id(bucket) -> str:
+    manifest_blob = bucket.blob("rag_index/current.json")
+    if not manifest_blob.exists():
+        raise HTTPException(status_code=404, detail="rag_index/current.json does not exist.")
+    try:
+        manifest = json.loads(manifest_blob.download_as_text())
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse rag_index/current.json: {exc}") from exc
+    return _validated_release_id(str(manifest.get("release_id", "")))
+
+
+def _download_index_pair(bucket, prefix: str, destination: Path) -> dict:
+    """Download an exact FAISS pair for read-only validation or merge staging."""
+    destination.mkdir(parents=True, exist_ok=True)
+    objects = {}
+    for filename in _GCS_INDEX_FILES:
+        object_name = f"{prefix}/{filename}"
+        blob = bucket.blob(object_name)
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail=f"Missing required GCS object: {object_name}")
+        blob.reload()
+        blob.download_to_filename(str(destination / filename))
+        objects[filename] = {
+            "name": object_name,
+            "size": blob.size,
+            "generation": blob.generation,
+            "updated_at": blob.updated.isoformat() if blob.updated else None,
+        }
+    return objects
+
+
+def _backup_primary_index_pair(bucket_name: str) -> dict:
+    """Create a generation-guarded, byte-for-byte backup before recovery writes."""
+    bucket = _gcs_client().bucket(bucket_name)
+    backup_prefix = f"rag_index/recovery-backups/{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}"
+    copied_objects = {}
+
+    for filename in _GCS_INDEX_FILES:
+        source = bucket.blob(f"rag_index/{filename}")
+        source.reload()
+        if source.generation is None:
+            raise RuntimeError(f"Primary object has no generation: {source.name}")
+
+        destination = bucket.copy_blob(
+            source,
+            bucket,
+            new_name=f"{backup_prefix}/{filename}",
+            source_generation=source.generation,
+            if_source_generation_match=source.generation,
+            if_generation_match=0,
+        )
+        destination.reload()
+        hash_matches = (
+            source.md5_hash and destination.md5_hash == source.md5_hash
+        ) or (
+            source.crc32c and destination.crc32c == source.crc32c
+        )
+        if destination.size != source.size or not hash_matches:
+            raise RuntimeError(f"Backup verification failed for {source.name}")
+        copied_objects[filename] = {
+            "source": source.name,
+            "source_generation": source.generation,
+            "backup": destination.name,
+            "backup_generation": destination.generation,
+            "size": destination.size,
+            "md5_hash": destination.md5_hash,
+        }
+
+    return {"prefix": backup_prefix, "objects": copied_objects}
+
+
+def _open_saved_index(index_dir: Path) -> FAISSDatabase:
+    return FAISSDatabase(
+        model_name=_current_config["hf_model_name"],
+        gemini_api_key=_current_config["gemini_api_key"],
+        index_path=str(index_dir),
+        device=_current_config["device"],
+    )
+
+
+def _index_pair_report(index_dir: Path, objects: dict) -> tuple[FAISSDatabase, dict]:
+    checksums = {}
+    for filename in _GCS_INDEX_FILES:
+        digest = hashlib.sha256()
+        with (index_dir / filename).open("rb") as index_file:
+            for block in iter(lambda: index_file.read(1024 * 1024), b""):
+                digest.update(block)
+        checksums[filename] = digest.hexdigest()
+
+    database = _open_saved_index(index_dir)
+    report = database.integrity_report()
+    report["objects"] = objects
+    report["sha256"] = checksums
+    report["document_urls"] = len(database.get_indexed_urls())
+    report["document_titles"] = len({chunk.doc_title for chunk in database._meta.values()})
+    return database, report
+
+
+def _inspect_release_merge(bucket_name: str, release_id: str) -> tuple[FAISSDatabase, FAISSDatabase, dict]:
+    client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        staging = Path(temporary_dir)
+        primary_objects = _download_index_pair(bucket, "rag_index", staging / "primary")
+        release_objects = _download_index_pair(bucket, f"rag_index/releases/{release_id}", staging / "release")
+        primary_db, primary_report = _index_pair_report(staging / "primary", primary_objects)
+        release_db, release_report = _index_pair_report(staging / "release", release_objects)
+
+        primary_urls = primary_db.get_indexed_urls()
+        release_urls = release_db.get_indexed_urls()
+        primary_chunk_ids = {chunk.chunk_id for chunk in primary_db._meta.values()}
+        release_chunk_ids = {chunk.chunk_id for chunk in release_db._meta.values()}
+        compatible = (
+            primary_report["valid"]
+            and release_report["valid"]
+            and primary_report["dimension"] == release_report["dimension"]
+            and primary_report["faiss_type"] == release_report["faiss_type"]
+            and primary_report["vector_count"] > 0
+            and release_report["vector_count"] > 0
+        )
+        report = {
+            "release_id": release_id,
+            "primary": primary_report,
+            "release": release_report,
+            "overlap": {
+                "source_urls": len(primary_urls & release_urls),
+                "chunk_ids": len(primary_chunk_ids & release_chunk_ids),
+                "release_urls_not_in_primary": len(release_urls - primary_urls),
+            },
+            "merge_safe": compatible,
+            "merge_refusal_reason": None if compatible else (
+                "The two saved pairs fail integrity checks, use different FAISS structures/dimensions, "
+                "or either index is empty. No merge may be attempted."
+            ),
+        }
+
+        # The caller needs independent in-memory databases after the temporary files disappear.
+        primary_db.save(str(staging / "primary-copy"))
+        release_db.save(str(staging / "release-copy"))
+        primary_copy = _open_saved_index(staging / "primary-copy")
+        release_copy = _open_saved_index(staging / "release-copy")
+        return primary_copy, release_copy, report
 
 
 def _download_system_prompt_from_gcs(bucket_name: str, config_dir: str) -> bool:
@@ -1599,6 +1755,11 @@ class CleanupRequest(BaseModel):
     section_filter:           Optional[str] = None
 
 
+class ReleaseMergeRequest(BaseModel):
+    release_id: str
+    confirmation: str
+
+
 # ---------------------------------------------------------------------------
 # Thread-pool helper
 # ---------------------------------------------------------------------------
@@ -2319,6 +2480,108 @@ def inspect_gcs_storage(
         "bucket_listing_error": bucket_listing_error,
         "object_limit_per_bucket": object_limit,
         "buckets": buckets,
+    }
+
+
+@app.get("/admin/index-recovery/inspect")
+def inspect_index_recovery(
+    _: AdminDep,
+    release_id: Optional[str] = Query(None),
+):
+    """Read and validate the primary FAISS pair against one saved release without writing anything."""
+    bucket_name = _current_config.get("gcs_bucket", "")
+    if not bucket_name:
+        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
+
+    bucket = _gcs_client().bucket(bucket_name)
+    selected_release = _validated_release_id(release_id) if release_id else _resolve_current_release_id(bucket)
+    _, _, report = _inspect_release_merge(bucket_name, selected_release)
+    report["mode"] = "read_only"
+    return report
+
+
+@app.post("/admin/index-recovery/merge")
+@_serialized_index_mutation
+def merge_release_into_primary(body: ReleaseMergeRequest, _: AdminDep):
+    """Merge one validated release into the primary GCS FAISS pair without re-ingesting source files."""
+    if body.confirmation != "MERGE_RELEASE_INTO_PRIMARY":
+        raise HTTPException(
+            status_code=400,
+            detail="Set confirmation to MERGE_RELEASE_INTO_PRIMARY after reviewing the inspection result.",
+        )
+
+    bucket_name = _current_config.get("gcs_bucket", "")
+    if not bucket_name:
+        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
+
+    release_id = _validated_release_id(body.release_id)
+    primary_db, release_db, inspection = _inspect_release_merge(bucket_name, release_id)
+    if not inspection["merge_safe"]:
+        raise HTTPException(status_code=409, detail=inspection)
+
+    try:
+        backup = _backup_primary_index_pair(bucket_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Primary backup failed; merge was not attempted: {exc}",
+        ) from exc
+    for filename in _GCS_INDEX_FILES:
+        inspected_generation = inspection["primary"]["objects"][filename]["generation"]
+        if backup["objects"][filename]["source_generation"] != inspected_generation:
+            raise HTTPException(
+                status_code=409,
+                detail="Primary index changed after inspection. A backup was made, but merge was not attempted.",
+            )
+
+    try:
+        merge_result = primary_db.merge_from(release_db)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"Merge refused: {exc}") from exc
+
+    final_report = primary_db.integrity_report()
+    expected_vectors = (
+        inspection["primary"]["vector_count"]
+        - merge_result["removed_chunks"]
+        + merge_result["added_chunks"]
+    )
+    if not final_report["valid"] or final_report["vector_count"] != expected_vectors:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Merged index failed its post-merge integrity check; primary GCS objects were not changed.",
+                "integrity": final_report,
+                "expected_vectors": expected_vectors,
+            },
+        )
+
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        merged_dir = Path(temporary_dir) / "merged"
+        primary_db.save(str(merged_dir))
+        verified_db = _open_saved_index(merged_dir)
+        verified_report = verified_db.integrity_report()
+        if not verified_report["valid"] or verified_report["vector_count"] != expected_vectors:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "The saved merged pair failed verification; primary GCS objects were not changed.",
+                    "integrity": verified_report,
+                    "expected_vectors": expected_vectors,
+                },
+            )
+        _upload_index_to_gcs(bucket_name, str(merged_dir))
+
+    global _rag
+    primary_db.save(_current_config["index_dir"])
+    _rag = None
+    return {
+        "merged": True,
+        "release_id": release_id,
+        "backup": backup,
+        "merge_result": merge_result,
+        "before": inspection,
+        "after": primary_db.stats(),
+        "storage": "rag_index/faiss.index and rag_index/metadata.pkl",
     }
 
 

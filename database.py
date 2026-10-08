@@ -248,10 +248,15 @@ class FAISSDatabase:
         return self._remove_int_ids(to_del)
 
     def delete_by_url(self, url: str) -> int:
+        if not url:
+            return 0
         to_del = [iid for iid, c in self._meta.items() if c.doc_url == url]
         return self._remove_int_ids(to_del)
 
     def delete_by_urls(self, urls: set[str]) -> int:
+        urls = {url for url in urls if url}
+        if not urls:
+            return 0
         to_del = [iid for iid, c in self._meta.items() if c.doc_url in urls]
         return self._remove_int_ids(to_del)
 
@@ -421,6 +426,119 @@ class FAISSDatabase:
         self._rebuild_bm25()
         
         logger.info("Index loaded ← %s  (%d chunks)", directory, len(self._meta))
+
+    def integrity_report(self) -> dict:
+        """Return structural checks needed before copying vectors between indexes."""
+        issues: list[str] = []
+        try:
+            faiss_ids = {int(value) for value in faiss.vector_to_array(self._index.id_map)}
+        except Exception as exc:
+            faiss_ids = set()
+            issues.append(f"Could not read the FAISS ID map: {exc}")
+
+        metadata_ids = set(self._meta)
+        non_integer_metadata_ids = [value for value in metadata_ids if not isinstance(value, int)]
+        if non_integer_metadata_ids:
+            issues.append("Metadata contains non-integer FAISS IDs.")
+        if self._index.ntotal != len(self._meta):
+            issues.append(
+                f"FAISS vector count ({self._index.ntotal}) does not match metadata count ({len(self._meta)})."
+            )
+        if faiss_ids != metadata_ids:
+            issues.append("FAISS IDs do not exactly match metadata IDs.")
+        if not isinstance(self._next_id, int) or self._next_id < 0:
+            issues.append("Metadata next_id is not a non-negative integer.")
+        elif metadata_ids and not non_integer_metadata_ids and self._next_id <= max(metadata_ids):
+            issues.append("Metadata next_id is not greater than every stored ID.")
+
+        required_fields = {
+            "chunk_id": str,
+            "doc_index": int,
+            "doc_title": str,
+            "section": str,
+            "doc_url": str,
+            "doc_type": str,
+            "chunk_index": int,
+            "text": str,
+            "raw_content": str,
+            "metadata": dict,
+        }
+        bad_chunks = []
+        for int_id, chunk in self._meta.items():
+            invalid_fields = [
+                name for name, expected_type in required_fields.items()
+                if not isinstance(getattr(chunk, name, None), expected_type)
+            ]
+            if invalid_fields:
+                bad_chunks.append({"id": int_id, "fields": invalid_fields})
+                if len(bad_chunks) == 10:
+                    break
+        if bad_chunks:
+            issues.append("One or more metadata entries do not match the DocumentChunk schema.")
+
+        return {
+            "valid": not issues,
+            "issues": issues,
+            "faiss_type": type(self._index).__name__,
+            "dimension": self._index.d,
+            "vector_count": self._index.ntotal,
+            "metadata_count": len(self._meta),
+            "next_id": self._next_id,
+            "bad_chunks": bad_chunks,
+        }
+
+    def merge_from(self, source: "FAISSDatabase") -> dict:
+        """Copy validated source vectors and metadata without re-embedding content."""
+        destination_report = self.integrity_report()
+        source_report = source.integrity_report()
+        if not destination_report["valid"] or not source_report["valid"]:
+            raise ValueError("Both indexes must pass integrity checks before they can be merged.")
+        if self._index.d != source._index.d:
+            raise ValueError(
+                f"Embedding dimensions differ ({self._index.d} != {source._index.d}); merge refused."
+            )
+
+        source_items = list(source._meta.items())
+        source_urls = {chunk.doc_url for _, chunk in source_items if chunk.doc_url}
+        removed_chunks = self.delete_by_urls(source_urls)
+        existing_chunk_ids = {chunk.chunk_id for chunk in self._meta.values()}
+        additions = [
+            (int_id, chunk)
+            for int_id, chunk in source_items
+            if chunk.chunk_id not in existing_chunk_ids
+        ]
+
+        if not additions:
+            return {
+                "removed_chunks": removed_chunks,
+                "added_chunks": 0,
+                "skipped_duplicate_chunks": len(source_items),
+            }
+
+        try:
+            source_id_positions = {
+                int(vector_id): position
+                for position, vector_id in enumerate(faiss.vector_to_array(source._index.id_map))
+            }
+            vectors = np.vstack([
+                source._index.index.reconstruct(source_id_positions[int(int_id)])
+                for int_id, _ in additions
+            ]).astype(np.float32, copy=False)
+        except Exception as exc:
+            raise ValueError(f"Could not reconstruct source vectors for merge: {exc}") from exc
+
+        new_ids = np.arange(self._next_id, self._next_id + len(additions), dtype=np.int64)
+        self._index.add_with_ids(vectors, new_ids)
+        for new_id, (_, chunk) in zip(new_ids, additions):
+            self._meta[int(new_id)] = chunk
+        self._next_id += len(additions)
+        self._rebuild_bm25()
+
+        return {
+            "removed_chunks": removed_chunks,
+            "added_chunks": len(additions),
+            "skipped_duplicate_chunks": len(source_items) - len(additions),
+        }
 
     # -------------------------------------------------------------------------
     # Private / cleanup helpers
