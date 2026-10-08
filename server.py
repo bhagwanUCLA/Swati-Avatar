@@ -129,7 +129,7 @@ def _download_index_from_gcs(bucket_name: str, index_dir: str) -> bool:
         path    = Path(index_dir)
         path.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(dir=path) as tmpdir:
             temp_path = Path(tmpdir)
             for fname in _GCS_INDEX_FILES:
                 blob = bucket.blob(f"rag_index/{fname}")
@@ -2492,7 +2492,7 @@ def inspect_gcs_storage(
 
 
 @app.delete("/admin/index-releases")
-@_serialized_index_mutation
+@_serialized_index_recovery
 def delete_index_releases(body: ReleaseCleanupRequest, _: AdminDep):
     """Delete obsolete release snapshots and their pointer, preserving primary and backups."""
     if body.confirmation != "DELETE_RELEASE_SNAPSHOTS":
