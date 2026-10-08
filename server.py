@@ -2252,37 +2252,74 @@ def get_config(_: AdminDep):
 
 
 @app.get("/admin/gcs-index")
-def list_gcs_index(_: AdminDep):
-    """List persisted FAISS objects without returning their binary contents."""
-    bucket_name = _current_config.get("gcs_bucket", "")
-    if not bucket_name:
-        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
+def inspect_gcs_storage(
+    _: AdminDep,
+    object_limit: int = Query(1000, ge=1, le=5000),
+):
+    """Inventory every bucket and object the Cloud Run service account can read."""
+    client = _gcs_client()
+    configured_bucket = _current_config.get("gcs_bucket", "")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    bucket_names: list[str] = []
+    bucket_listing_error = None
 
-    try:
-        bucket = _gcs_client().bucket(bucket_name)
-        objects = [
-            {
-                "name": blob.name,
-                "size": blob.size,
-                "updated_at": blob.updated.isoformat() if blob.updated else None,
-                "generation": blob.generation,
-            }
-            for blob in bucket.list_blobs(prefix="rag_index/")
-        ]
-        manifest = None
-        manifest_blob = bucket.blob("rag_index/current.json")
-        if manifest_blob.exists():
-            manifest = manifest_blob.download_as_text()
+    if project:
+        try:
+            bucket_names = sorted(bucket.name for bucket in client.list_buckets(project=project))
+        except Exception as exc:
+            bucket_listing_error = str(exc)
 
-        return {
-            "bucket": bucket_name,
-            "object_count": len(objects),
-            "objects": objects,
-            "release_manifest": manifest,
-        }
-    except Exception as exc:
-        logger.exception("Unable to list GCS index objects.")
-        raise HTTPException(status_code=503, detail=f"Unable to list GCS index objects: {exc}") from exc
+    if configured_bucket and configured_bucket not in bucket_names:
+        bucket_names.append(configured_bucket)
+
+    if not bucket_names:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No accessible buckets were discovered. "
+                f"Bucket-list error: {bucket_listing_error or 'GCS_BUCKET is not configured.'}"
+            ),
+        )
+
+    buckets = []
+    for bucket_name in bucket_names:
+        try:
+            bucket = client.bucket(bucket_name)
+            objects = []
+            truncated = False
+            for blob in bucket.list_blobs():
+                if len(objects) >= object_limit:
+                    truncated = True
+                    break
+                objects.append({
+                    "name": blob.name,
+                    "size": blob.size,
+                    "updated_at": blob.updated.isoformat() if blob.updated else None,
+                    "generation": blob.generation,
+                    "content_type": blob.content_type,
+                })
+
+            buckets.append({
+                "name": bucket_name,
+                "accessible": True,
+                "object_count_returned": len(objects),
+                "truncated": truncated,
+                "objects": objects,
+            })
+        except Exception as exc:
+            buckets.append({
+                "name": bucket_name,
+                "accessible": False,
+                "error": str(exc),
+            })
+
+    return {
+        "project": project or None,
+        "configured_index_bucket": configured_bucket or None,
+        "bucket_listing_error": bucket_listing_error,
+        "object_limit_per_bucket": object_limit,
+        "buckets": buckets,
+    }
 
 
 @app.post("/config")
