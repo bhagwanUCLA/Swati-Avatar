@@ -1764,8 +1764,7 @@ class CleanupRequest(BaseModel):
     section_filter:           Optional[str] = None
 
 
-class ReleaseMergeRequest(BaseModel):
-    release_id: str
+class ReleaseCleanupRequest(BaseModel):
     confirmation: str
 
 
@@ -2492,107 +2491,44 @@ def inspect_gcs_storage(
     }
 
 
-@app.get("/admin/index-recovery/inspect")
-def inspect_index_recovery(
-    _: AdminDep,
-    release_id: Optional[str] = Query(None),
-):
-    """Read and validate the primary FAISS pair against one saved release without writing anything."""
+@app.delete("/admin/index-releases")
+@_serialized_index_mutation
+def delete_index_releases(body: ReleaseCleanupRequest, _: AdminDep):
+    """Delete obsolete release snapshots and their pointer, preserving primary and backups."""
+    if body.confirmation != "DELETE_RELEASE_SNAPSHOTS":
+        raise HTTPException(
+            status_code=400,
+            detail="Set confirmation to DELETE_RELEASE_SNAPSHOTS to delete only obsolete release snapshots.",
+        )
+
     bucket_name = _current_config.get("gcs_bucket", "")
     if not bucket_name:
         raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
 
     bucket = _gcs_client().bucket(bucket_name)
-    selected_release = _validated_release_id(release_id) if release_id else _resolve_current_release_id(bucket)
-    _, _, report = _inspect_release_merge(bucket_name, selected_release)
-    report["mode"] = "read_only"
-    return report
+    release_blobs = list(bucket.list_blobs(prefix="rag_index/releases/"))
+    for blob in release_blobs:
+        blob.reload()
+        blob.delete(if_generation_match=blob.generation)
 
+    manifest_blob = bucket.blob("rag_index/current.json")
+    deleted_manifest = False
+    if manifest_blob.exists():
+        manifest_blob.reload()
+        manifest_blob.delete(if_generation_match=manifest_blob.generation)
+        deleted_manifest = True
 
-@app.post("/admin/index-recovery/merge")
-@_serialized_index_recovery
-def merge_release_into_primary(body: ReleaseMergeRequest, _: AdminDep):
-    """Merge one validated release into the primary GCS FAISS pair without re-ingesting source files."""
-    if body.confirmation != "MERGE_RELEASE_INTO_PRIMARY":
-        raise HTTPException(
-            status_code=400,
-            detail="Set confirmation to MERGE_RELEASE_INTO_PRIMARY after reviewing the inspection result.",
-        )
-
-    bucket_name = _current_config.get("gcs_bucket", "")
-    if not bucket_name:
-        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
-
-    release_id = _validated_release_id(body.release_id)
-    primary_db, release_db, inspection = _inspect_release_merge(bucket_name, release_id)
-    if not inspection["merge_safe"]:
-        raise HTTPException(status_code=409, detail=inspection)
-
-    try:
-        backup = _backup_primary_index_pair(bucket_name)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Primary backup failed; merge was not attempted: {exc}",
-        ) from exc
-    for filename in _GCS_INDEX_FILES:
-        inspected_generation = inspection["primary"]["objects"][filename]["generation"]
-        if backup["objects"][filename]["source_generation"] != inspected_generation:
-            raise HTTPException(
-                status_code=409,
-                detail="Primary index changed after inspection. A backup was made, but merge was not attempted.",
-            )
-
-    try:
-        merge_result = primary_db.merge_from(release_db)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=f"Merge refused: {exc}") from exc
-
-    final_report = primary_db.integrity_report()
-    expected_vectors = (
-        inspection["primary"]["vector_count"]
-        - merge_result["removed_chunks"]
-        + merge_result["added_chunks"]
-    )
-    if not final_report["valid"] or final_report["vector_count"] != expected_vectors:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Merged index failed its post-merge integrity check; primary GCS objects were not changed.",
-                "integrity": final_report,
-                "expected_vectors": expected_vectors,
-            },
-        )
-
-    with tempfile.TemporaryDirectory() as temporary_dir:
-        merged_dir = Path(temporary_dir) / "merged"
-        primary_db.save(str(merged_dir))
-        verified_db = _open_saved_index(merged_dir)
-        verified_report = verified_db.integrity_report()
-        if not verified_report["valid"] or verified_report["vector_count"] != expected_vectors:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "The saved merged pair failed verification; primary GCS objects were not changed.",
-                    "integrity": verified_report,
-                    "expected_vectors": expected_vectors,
-                },
-            )
-        _upload_index_to_gcs(bucket_name, str(merged_dir))
-
-    global _rag, _index_storage_ready, _index_storage_error
-    primary_db.save(_current_config["index_dir"])
-    _rag = None
-    _index_storage_ready = True
-    _index_storage_error = None
+    release_ids = {
+        blob.name.split("/")[2]
+        for blob in release_blobs
+        if len(blob.name.split("/")) >= 4
+    }
     return {
-        "merged": True,
-        "release_id": release_id,
-        "backup": backup,
-        "merge_result": merge_result,
-        "before": inspection,
-        "after": primary_db.stats(),
-        "storage": "rag_index/faiss.index and rag_index/metadata.pkl",
+        "deleted_release_objects": len(release_blobs),
+        "deleted_release_count": len(release_ids),
+        "deleted_manifest": deleted_manifest,
+        "preserved_primary": [f"rag_index/{filename}" for filename in _GCS_INDEX_FILES],
+        "preserved_backups_prefix": "rag_index/recovery-backups/",
     }
 
 
