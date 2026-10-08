@@ -986,51 +986,6 @@ def _restart_sync_job(job_id: str) -> dict:
     return _sync_job_status(job_id)
 
 
-def _remove_gdrive_video_items(job_id: str) -> dict:
-    db_fs = _sync_jobs_client()
-    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    job_doc = job_ref.get()
-    if not job_doc.exists:
-        raise HTTPException(status_code=404, detail="Sync job not found.")
-
-    job = job_doc.to_dict() or {}
-    if job.get("source") != "gdrive":
-        raise HTTPException(status_code=400, detail="Video removal is only available for Google Drive jobs.")
-
-    items = list(job_ref.collection("items").stream())
-    processing_items = [
-        item_doc.id
-        for item_doc in items
-        if (item_doc.to_dict() or {}).get("status") == _SYNC_ITEM_PROCESSING
-    ]
-    if processing_items:
-        raise HTTPException(
-            status_code=409,
-            detail="Wait for the active item to finish before removing videos.",
-        )
-
-    batch = db_fs.batch()
-    removed = 0
-    for item_doc in items:
-        item = item_doc.to_dict() or {}
-        mime_type = str((item.get("metadata") or {}).get("mime_type") or "")
-        if not mime_type.startswith("video/"):
-            continue
-        batch.delete(item_doc.reference)
-        batch.delete(_sync_source_item_reference(
-            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-        ))
-        removed += 1
-
-    if removed:
-        batch.commit()
-        _refresh_sync_job_status(job_id)
-
-    result = _sync_job_status(job_id)
-    result["removed_video_items"] = removed
-    return result
-
-
 def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
     db_fs = _sync_jobs_client()
     job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
@@ -2296,6 +2251,40 @@ def get_config(_: AdminDep):
     return safe
 
 
+@app.get("/admin/gcs-index")
+def list_gcs_index(_: AdminDep):
+    """List persisted FAISS objects without returning their binary contents."""
+    bucket_name = _current_config.get("gcs_bucket", "")
+    if not bucket_name:
+        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
+
+    try:
+        bucket = _gcs_client().bucket(bucket_name)
+        objects = [
+            {
+                "name": blob.name,
+                "size": blob.size,
+                "updated_at": blob.updated.isoformat() if blob.updated else None,
+                "generation": blob.generation,
+            }
+            for blob in bucket.list_blobs(prefix="rag_index/")
+        ]
+        manifest = None
+        manifest_blob = bucket.blob("rag_index/current.json")
+        if manifest_blob.exists():
+            manifest = manifest_blob.download_as_text()
+
+        return {
+            "bucket": bucket_name,
+            "object_count": len(objects),
+            "objects": objects,
+            "release_manifest": manifest,
+        }
+    except Exception as exc:
+        logger.exception("Unable to list GCS index objects.")
+        raise HTTPException(status_code=503, detail=f"Unable to list GCS index objects: {exc}") from exc
+
+
 @app.post("/config")
 def update_config(body: ConfigUpdate, _: AdminDep):
     global _rag, _current_config
@@ -2426,12 +2415,6 @@ def pause_sync_job(job_id: str, _: AdminDep):
 def restart_sync_job(job_id: str, _: AdminDep):
     """Resume a paused job after pause has reset its unfinished items."""
     return _restart_sync_job(job_id)
-
-
-@app.post("/sync-jobs/{job_id}/remove-videos")
-def remove_sync_job_videos(job_id: str, _: AdminDep):
-    """Remove non-processing video items from a Google Drive sync job."""
-    return _remove_gdrive_video_items(job_id)
 
 
 @app.delete("/sync-jobs/{job_id}/items/{item_id}")

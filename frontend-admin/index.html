@@ -1365,7 +1365,6 @@ function renderSyncJob(job) {
       <div class="sync-job-actions">
         ${canPause ? `<button class="btn btn-sm" onclick="runSyncJobAction('${job.id}', 'pause')">Pause & reset unfinished</button>` : ''}
         ${canRestart ? `<button class="btn btn-sm btn-primary" onclick="runSyncJobAction('${job.id}', 'restart')">Restart</button>` : ''}
-        ${job.source === 'gdrive' ? `<button class="btn btn-sm" onclick="runSyncJobAction('${job.id}', 'remove-videos')">Remove non-processing videos</button>` : ''}
       </div>
       <div class="sync-job-items">${itemsHtml || '<div style="padding:12px;color:var(--muted);font-size:12px">No queued items.</div>'}</div>
     </section>`;
@@ -1380,7 +1379,6 @@ async function runSyncJobAction(jobId, action) {
   const labels = {
     pause: 'Pause this job and reset every unfinished item to pending?',
     restart: 'Restart this paused job?',
-    'remove-videos': 'Remove all non-processing video items from this Drive job?',
   };
   if (!confirm(labels[action])) return;
 
