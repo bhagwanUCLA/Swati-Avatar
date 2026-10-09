@@ -864,7 +864,6 @@ async function doLogin() {
 }
 
 function doLogout() {
-  stopSyncJobsRefresh();
   sessionStorage.removeItem('admin_token');
   document.getElementById('login-token').value = '';
   document.getElementById('login-error').textContent = '';
@@ -1033,8 +1032,7 @@ function switchTab(event, name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   if (event && event.currentTarget) event.currentTarget.classList.add('active');
   document.getElementById('panel-' + name).classList.add('active');
-  if (name === 'jobs') startSyncJobsRefresh();
-  else stopSyncJobsRefresh();
+  if (name === 'jobs') refreshSyncJobs();
   if (name === 'index') loadIndex();
   if (name === 'chats') loadChats();
   if (name === 'prompt') onPromptTabOpen();
@@ -1339,23 +1337,10 @@ function simpleMd(text) {
 }
 
 // ── SYNC JOBS ───────────────────────────────────────────────────────────
-const SYNC_JOBS_REFRESH_MS = 15_000;
 const SYNC_ITEMS_PAGE_SIZE = 50;
-let syncJobsRefreshTimer = null;
 let syncJobsLoading = false;
 let syncItems = [];
 let syncItemsTotal = 0;
-
-function startSyncJobsRefresh() {
-  stopSyncJobsRefresh();
-  refreshSyncJobs();
-  syncJobsRefreshTimer = setInterval(refreshSyncJobs, SYNC_JOBS_REFRESH_MS);
-}
-
-function stopSyncJobsRefresh() {
-  if (syncJobsRefreshTimer) clearInterval(syncJobsRefreshTimer);
-  syncJobsRefreshTimer = null;
-}
 
 function refreshSyncJobs() {
   loadSyncJobs(true);
