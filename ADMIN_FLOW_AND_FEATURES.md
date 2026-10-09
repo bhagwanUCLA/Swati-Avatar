@@ -100,8 +100,8 @@ The flat Scheduled Jobs interface intentionally does not group or display items 
 | `GET /sync-items?limit=500` | Newest-first flat list used by Scheduled Jobs. |
 | `GET /sync-jobs` | Internal/recovery-oriented list of job records. |
 | `GET /sync-jobs/{job_id}` | One job and its item records. |
-| `POST /sync-jobs/{job_id}/pause` | Pause and reset unfinished items. |
-| `POST /sync-jobs/{job_id}/restart` | Resume a paused job. |
+| `POST /sync-jobs/{job_id}/pause` | Pause new claims while an active item finishes or fails. |
+| `POST /sync-jobs/{job_id}/restart` | Resume a paused job and requeue failed items. |
 | `DELETE /sync-jobs/{job_id}/items/{item_id}` | Remove a pending or failed item. |
 
 ## Manual Ingestion
@@ -112,9 +112,10 @@ The panel cleans pasted text in the browser, then posts it to `POST /ingest/docu
 The endpoint creates `paste` items and wakes the shared worker. It returns immediately
 with a queue result; embedding and FAISS writes happen later in the worker.
 
-Each item retains its title, selected section, optional source URL, document type, and
-text content in its Firestore metadata. When claimed, the worker chunks and embeds the
-text, updates the shared primary index pair, and marks the item completed.
+The text is staged as a temporary `.txt` object under `sync_uploads/` in the configured
+GCS bucket. The Firestore item retains only its title, selected section, optional source
+URL, document type, and staged-object path. When claimed, the worker downloads the text,
+chunks and embeds it, updates the shared primary index pair, and marks the item completed.
 
 ### File / Zip
 
@@ -159,16 +160,17 @@ a stable `gdrive://<file_id>` source URL.
 
 ### Blog CMS
 
-`POST /blogs/sync` discovers new or updated CMS entries and creates `blogs` items. An
-item carries either the blog text or a PDF URL. The worker indexes one blog item at a
-time with a stable `cms://blog/<blog_id>` source URL.
+`POST /blogs/sync` discovers new or updated CMS entries and creates `blogs` items. Blog
+PDFs remain remote URLs; text-only blogs are staged as temporary `.txt` objects in GCS.
+The worker indexes one blog item at a time with a stable `cms://blog/<blog_id>` source
+URL.
 
 ### YouTube Notifications
 
-`POST /youtube/notify` verifies the optional Hub signature, parses YouTube notification
-entries, creates `youtube` items using the video ID, wakes the worker, and returns
-`204` without waiting for transcription or indexing. The worker processes each video
-later using its canonical YouTube URL.
+`POST /youtube/notify` requires a valid Hub signature and a configured watched-channel
+topic, parses YouTube notification entries, creates `youtube` items using the video ID,
+wakes the worker, and returns `204` without waiting for transcription or indexing. The
+worker processes each video later using its canonical YouTube URL.
 
 ## Knowledge Base
 
@@ -177,7 +179,7 @@ The Knowledge Base tab calls:
 - `GET /stats` for chunk, document, section, embedding, and cache statistics.
 - `GET /documents` for the document list.
 - `GET /documents/{doc_index}/chunks` when an admin opens a document card.
-- `DELETE /documents/{title}` to delete all chunks for a named document.
+- `DELETE /documents/{doc_index}` to delete all chunks for one document.
 
 Document deletion and cleanup are serialized with worker writes and save the same shared
 primary FAISS and metadata pair.

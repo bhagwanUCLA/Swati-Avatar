@@ -169,7 +169,6 @@ python delete.py
                     │
                     ▼
   server.py routes (admin-protected):
-    POST /ingest          → crawl portfolio URL(s)
     POST /ingest/folder   → upload ZIP, PDF, Office files
     POST /ingest/videos   → YouTube URLs or playlists
     POST /ingest/documents→ paste raw text directly
@@ -251,12 +250,11 @@ When a user asks a question via `/query/stream` or `/query`:
 |--------|------|-------------|
 | GET | `/config` | Current server config (API keys masked) |
 | POST | `/config` | Update config (resets RAG instance) |
-| POST | `/ingest` | Crawl portfolio URL |
 | POST | `/ingest/folder` | Upload ZIP or PDF file |
 | POST | `/ingest/documents` | Inject raw text documents |
 | POST | `/ingest/videos` | Ingest YouTube URLs / playlists |
 | GET | `/documents` | List indexed documents |
-| DELETE | `/documents/{title}` | Delete all chunks for a document |
+| DELETE | `/documents/{doc_index}` | Delete all chunks for one document |
 | POST | `/cleanup/preview` | Dry-run quality filter (repeated words, short chunks, regex) |
 | POST | `/cleanup/apply` | Apply quality filter and delete matched chunks |
 | GET | `/sessions` | List session IDs |
@@ -358,9 +356,10 @@ gunicorn -k uvicorn.workers.UvicornWorker server:app \
 New videos published on watched channels are automatically transcribed and added to the FAISS index within ~30 seconds of upload — no polling, no manual action.
 
 ### How it works
-1. YouTube pushes an Atom XML payload to `POST /youtube/notify` when a new video is published
-2. The endpoint parses the video ID, calls `ingest_videos`, and saves to GCS
-3. Subscriptions expire after 30 days — Cloud Scheduler re-registers every 15 days
+1. Cloud Scheduler calls `POST /youtube/resubscribe` to renew each watched-channel subscription.
+2. YouTube pushes a signed Atom XML payload to `POST /youtube/notify` when a new video is published.
+3. The endpoint queues the video and returns immediately; the shared worker ingests it later.
+4. Subscriptions expire after 30 days — Cloud Scheduler re-registers every 15 days.
 
 ### Setup (one-time)
 
@@ -368,8 +367,8 @@ New videos published on watched channels are automatically transcribed and added
 
 | Variable | Value |
 |---|---|
-| `WATCHED_CHANNEL_IDS` | YouTube channel ID(s), comma-separated (e.g. `UCxxxxxxxxxxxxxx`) |
-| `PUBSUB_SECRET` | Random secret: `openssl rand -hex 32` |
+| `WATCHED_CHANNEL_IDS` | Required YouTube channel ID(s), comma-separated (e.g. `UCxxxxxxxxxxxxxx`) |
+| `PUBSUB_SECRET` | Required random HMAC secret: `openssl rand -hex 32` |
 
 **2. Bootstrap the subscription** — click "Resubscribe YouTube" in the admin panel, or:
 ```bash
@@ -424,11 +423,9 @@ scraper_cache/
 └─ skip_list.json          # URLs never re-scraped (manually ingested pages)
 ```
 
-The cache is **independent of the FAISS index**. You can rebuild the entire vector index from cache with zero API/network calls:
-
-```
-POST /ingest  { "url": "https://...", "rebuild": true }
-```
+The cache is **independent of the FAISS index**. It is an internal scraper
+optimization; the retired synchronous portfolio-crawl endpoint is not exposed
+by the API.
 
 ---
 

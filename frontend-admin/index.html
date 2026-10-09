@@ -626,12 +626,18 @@
   <div id="panel-jobs" class="panel">
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
-        <div class="card-title" style="margin:0">Scheduled Queue &amp; Activity</div>
-        <button class="btn btn-sm" onclick="loadSyncJobs()">↺ Refresh</button>
+        <div>
+          <div class="card-title" style="margin:0">Scheduled Queue &amp; Activity</div>
+          <div id="sync-jobs-total-label" style="font-size:12px;color:var(--muted);margin-top:2px"></div>
+        </div>
+        <button class="btn btn-sm" onclick="refreshSyncJobs()">↺ Refresh</button>
       </div>
       <p class="hint">Newest items appear first. This is one shared queue and activity log; source identifies where each item came from.</p>
       <div id="sync-jobs-status" class="chats-status" style="display:none"></div>
       <div id="sync-jobs-list"></div>
+      <div class="btn-group" style="margin-top:14px;justify-content:center">
+        <button class="btn" id="sync-load-more-btn" style="display:none" onclick="loadMoreSyncJobs()">Load more</button>
+      </div>
     </div>
   </div>
 
@@ -762,7 +768,6 @@ copyright \d{4}"></textarea>
 
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 // ── Auth & API config ─────────────────────────────────────────────────────
 // Backend URL is hardcoded at deploy time — edit this line before deploying.
@@ -1041,7 +1046,10 @@ async function ingestDocuments() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
-    showToast('doc-toast', `✓ Queued ${data.queued} text item(s). See Scheduled Jobs.`, 'ok');
+    const failureText = data.preparation_failed
+      ? ` ${data.preparation_failed} item(s) failed preparation; see Scheduled Jobs.`
+      : '';
+    showToast('doc-toast', `✓ Queued ${data.queued} text item(s). See Scheduled Jobs.${failureText}`, 'ok');
   } catch(e) {
     showToast('doc-toast', '✕ ' + e.message, 'err');
   }
@@ -1293,13 +1301,16 @@ function simpleMd(text) {
 
 // ── SYNC JOBS ───────────────────────────────────────────────────────────
 const SYNC_JOBS_REFRESH_MS = 10_000;
+const SYNC_ITEMS_PAGE_SIZE = 50;
 let syncJobsRefreshTimer = null;
 let syncJobsLoading = false;
+let syncItems = [];
+let syncItemsTotal = 0;
 
 function startSyncJobsRefresh() {
   stopSyncJobsRefresh();
-  loadSyncJobs();
-  syncJobsRefreshTimer = setInterval(loadSyncJobs, SYNC_JOBS_REFRESH_MS);
+  refreshSyncJobs();
+  syncJobsRefreshTimer = setInterval(refreshSyncJobs, SYNC_JOBS_REFRESH_MS);
 }
 
 function stopSyncJobsRefresh() {
@@ -1307,21 +1318,39 @@ function stopSyncJobsRefresh() {
   syncJobsRefreshTimer = null;
 }
 
-async function loadSyncJobs() {
+function refreshSyncJobs() {
+  loadSyncJobs(true);
+}
+
+function loadMoreSyncJobs() {
+  loadSyncJobs(false);
+}
+
+async function loadSyncJobs(reset = true) {
   if (syncJobsLoading || !getToken()) return;
   syncJobsLoading = true;
   const listEl = document.getElementById('sync-jobs-list');
   const statusEl = document.getElementById('sync-jobs-status');
+  const moreBtn = document.getElementById('sync-load-more-btn');
+  const totalLabel = document.getElementById('sync-jobs-total-label');
+  const offset = reset ? 0 : syncItems.length;
+  const limit = reset
+    ? Math.min(500, Math.max(SYNC_ITEMS_PAGE_SIZE, syncItems.length))
+    : SYNC_ITEMS_PAGE_SIZE;
 
   try {
-    const response = await authFetch(`${API}/sync-items?limit=500`);
+    const response = await authFetch(`${API}/sync-items?limit=${limit}&offset=${offset}`);
     if (!response.ok) throw new Error(await syncJobError(response));
     const data = await response.json();
-    const items = data.items || [];
+    const page = data.items || [];
+    syncItems = reset ? page : syncItems.concat(page);
+    syncItemsTotal = data.total || 0;
 
-    listEl.innerHTML = items.length
-      ? renderSyncItemList(items)
+    listEl.innerHTML = syncItems.length
+      ? renderSyncItemList(syncItems)
       : '<div style="padding:20px;text-align:center;color:var(--muted)">No scheduled items yet.</div>';
+    totalLabel.textContent = `${syncItems.length} of ${syncItemsTotal} item${syncItemsTotal !== 1 ? 's' : ''}`;
+    moreBtn.style.display = data.has_more ? 'inline-flex' : 'none';
     statusEl.style.display = 'none';
   } catch (error) {
     statusEl.textContent = `Failed to load sync jobs: ${error.message}`;
@@ -1520,7 +1549,7 @@ async function loadIndex() {
     docs.forEach((d, i) => {
       const cardId  = `doc-card-body-${i}`;
       const chevId  = `doc-chevron-${i}`;
-      // Build source HTML: blue link for web/YouTube, plain filename for file:// uploads
+      // Build source HTML: safe links for web URLs; other source identifiers stay as text.
       let sourceHtml = '—';
       if (d.url) {
         try {
@@ -1530,10 +1559,11 @@ async function loadIndex() {
             const rawName = urlObj.pathname.split('/').pop() || d.url;
             const decodedName = decodeURIComponent(rawName);
             sourceHtml = `<span style="font-family:var(--mono)">${esc(decodedName)}</span>`;
-          } else {
-            // Web or YouTube URL — show as blue clickable link
+          } else if (urlObj.protocol === 'https:' || urlObj.protocol === 'http:') {
             const label = urlObj.hostname + (urlObj.pathname !== '/' ? urlObj.pathname : '');
-            sourceHtml = `<a href="${d.url}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-family:var(--mono)" title="${esc(d.url)}">${esc(label)}</a>`;
+            sourceHtml = `<a href="${escAttr(urlObj.href)}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-family:var(--mono)" title="${escAttr(urlObj.href)}">${esc(label)}</a>`;
+          } else {
+            sourceHtml = `<span style="font-family:var(--mono)">${esc(d.url)}</span>`;
           }
         } catch { sourceHtml = esc(d.url); }
       }
@@ -1550,7 +1580,7 @@ async function loadIndex() {
               </div>
             </div>
             <div class="doc-card-actions">
-              <a href="#" class="btn-del" data-delete-title="${esc(d.title).replace(/"/g,'&quot;')}">Delete</a>
+              <a href="#" class="btn-del" data-delete-index="${d.doc_index}">Delete</a>
             </div>
             <svg id="${chevId}" class="doc-card-chevron" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
               <polyline points="6 9 12 15 18 9"/>
@@ -1567,10 +1597,10 @@ async function loadIndex() {
     // Event delegation on the accordion container
     listEl.addEventListener('click', async (e) => {
       // Delete button
-      const delBtn = e.target.closest('[data-delete-title]');
+      const delBtn = e.target.closest('[data-delete-index]');
       if (delBtn) {
-        const title = delBtn.getAttribute('data-delete-title');
-        await deleteDocument(title);
+        e.preventDefault();
+        await deleteDocument(Number(delBtn.getAttribute('data-delete-index')));
         return;
       }
       // Header click → toggle accordion
@@ -1591,12 +1621,15 @@ async function loadIndex() {
   }
 }
 
-async function deleteDocument(title) {
-  if (!confirm(`Are you sure you want to delete "${title}"? This will remove all associated chunks and cache entries.`)) return;
+async function deleteDocument(docIndex) {
+  if (!Number.isInteger(docIndex)) {
+    alert('Invalid document identifier. Refresh the Knowledge Base and try again.');
+    return;
+  }
+  if (!confirm('Are you sure you want to delete this document? This will remove all associated chunks and cache entries.')) return;
 
   try {
-    // Use encodeURIComponent because titles can have special characters/slashes
-    const res = await authFetch(API + '/documents/' + encodeURIComponent(title), { method: 'DELETE' });
+    const res = await authFetch(API + '/documents/' + docIndex, { method: 'DELETE' });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Delete failed');
 
@@ -1614,14 +1647,7 @@ async function loadDocumentChunks(docIndex, containerEl) {
     if (!res.ok) throw new Error(res.statusText);
     const data = await res.json();
 
-    // Render markdown using marked (assumes marked.js is loaded globally)
-    let html = '';
-    if (typeof marked !== 'undefined') {
-      html = `<div style="font-size:12px;line-height:1.7;color:var(--text)">${marked.parse(data.content)}</div>`;
-    } else {
-      // Fallback if marked not available
-      html = `<pre style="font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--muted);white-space:pre-wrap;overflow:auto">${esc(data.content)}</pre>`;
-    }
+    const html = `<div style="font-size:12px;line-height:1.7;color:var(--text)">${simpleMd(data.content)}</div>`;
     containerEl.innerHTML = html || '<div style="color:var(--muted);font-size:12px">No content found.</div>';
     containerEl.dataset.loaded = 'true';
   } catch(e) {
@@ -1793,6 +1819,10 @@ async function cleanupApply() {
 
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 </script>

@@ -55,6 +55,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import requests as _req
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 from typing import Annotated, AsyncGenerator, Optional
@@ -71,7 +72,6 @@ import zipfile
 
 
 from orchestrator import RAGOrchestrator
-from database import FAISSDatabase
 from rag_query import RAG
 from dotenv import load_dotenv
 
@@ -94,9 +94,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Portfolio RAG API", version="3.0")
 
+_CORS_ALLOWED_ORIGINS = [
+    "https://swati-desai-avatar.vercel.app",
+    "https://swati-avatar-admin.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -110,7 +115,6 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 # ---------------------------------------------------------------------------
 
 _GCS_INDEX_FILES = ["faiss.index", "metadata.pkl"]
-_RELEASE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _gcs_client():
@@ -167,159 +171,6 @@ def _upload_index_to_gcs(bucket_name: str, index_dir: str) -> None:
     except Exception as exc:
         logger.error("GCS upload failed: %s", exc)
         raise RuntimeError(f"GCS index upload failed: {exc}") from exc
-
-
-def _validated_release_id(release_id: str) -> str:
-    if not _RELEASE_ID_PATTERN.fullmatch(release_id):
-        raise HTTPException(
-            status_code=400,
-            detail="release_id must be the 32-character hexadecimal ID returned by the inspection endpoint.",
-        )
-    return release_id
-
-
-def _resolve_current_release_id(bucket) -> str:
-    manifest_blob = bucket.blob("rag_index/current.json")
-    if not manifest_blob.exists():
-        raise HTTPException(status_code=404, detail="rag_index/current.json does not exist.")
-    try:
-        manifest = json.loads(manifest_blob.download_as_text())
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Could not parse rag_index/current.json: {exc}") from exc
-    return _validated_release_id(str(manifest.get("release_id", "")))
-
-
-def _download_index_pair(bucket, prefix: str, destination: Path) -> dict:
-    """Download an exact FAISS pair for read-only validation or merge staging."""
-    destination.mkdir(parents=True, exist_ok=True)
-    objects = {}
-    for filename in _GCS_INDEX_FILES:
-        object_name = f"{prefix}/{filename}"
-        blob = bucket.blob(object_name)
-        if not blob.exists():
-            raise HTTPException(status_code=404, detail=f"Missing required GCS object: {object_name}")
-        blob.reload()
-        blob.download_to_filename(str(destination / filename))
-        objects[filename] = {
-            "name": object_name,
-            "size": blob.size,
-            "generation": blob.generation,
-            "updated_at": blob.updated.isoformat() if blob.updated else None,
-        }
-    return objects
-
-
-def _backup_primary_index_pair(bucket_name: str) -> dict:
-    """Create a generation-guarded, byte-for-byte backup before recovery writes."""
-    bucket = _gcs_client().bucket(bucket_name)
-    backup_prefix = f"rag_index/recovery-backups/{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex}"
-    copied_objects = {}
-
-    for filename in _GCS_INDEX_FILES:
-        source = bucket.blob(f"rag_index/{filename}")
-        source.reload()
-        if source.generation is None:
-            raise RuntimeError(f"Primary object has no generation: {source.name}")
-
-        destination = bucket.copy_blob(
-            source,
-            bucket,
-            new_name=f"{backup_prefix}/{filename}",
-            source_generation=source.generation,
-            if_source_generation_match=source.generation,
-            if_generation_match=0,
-        )
-        destination.reload()
-        hash_matches = (
-            source.md5_hash and destination.md5_hash == source.md5_hash
-        ) or (
-            source.crc32c and destination.crc32c == source.crc32c
-        )
-        if destination.size != source.size or not hash_matches:
-            raise RuntimeError(f"Backup verification failed for {source.name}")
-        copied_objects[filename] = {
-            "source": source.name,
-            "source_generation": source.generation,
-            "backup": destination.name,
-            "backup_generation": destination.generation,
-            "size": destination.size,
-            "md5_hash": destination.md5_hash,
-        }
-
-    return {"prefix": backup_prefix, "objects": copied_objects}
-
-
-def _open_saved_index(index_dir: Path) -> FAISSDatabase:
-    return FAISSDatabase(
-        model_name=_current_config["hf_model_name"],
-        gemini_api_key=_current_config["gemini_api_key"],
-        index_path=str(index_dir),
-        device=_current_config["device"],
-    )
-
-
-def _index_pair_report(index_dir: Path, objects: dict) -> tuple[FAISSDatabase, dict]:
-    checksums = {}
-    for filename in _GCS_INDEX_FILES:
-        digest = hashlib.sha256()
-        with (index_dir / filename).open("rb") as index_file:
-            for block in iter(lambda: index_file.read(1024 * 1024), b""):
-                digest.update(block)
-        checksums[filename] = digest.hexdigest()
-
-    database = _open_saved_index(index_dir)
-    report = database.integrity_report()
-    report["objects"] = objects
-    report["sha256"] = checksums
-    report["document_urls"] = len(database.get_indexed_urls())
-    report["document_titles"] = len({chunk.doc_title for chunk in database._meta.values()})
-    return database, report
-
-
-def _inspect_release_merge(bucket_name: str, release_id: str) -> tuple[FAISSDatabase, FAISSDatabase, dict]:
-    client = _gcs_client()
-    bucket = client.bucket(bucket_name)
-    with tempfile.TemporaryDirectory() as temporary_dir:
-        staging = Path(temporary_dir)
-        primary_objects = _download_index_pair(bucket, "rag_index", staging / "primary")
-        release_objects = _download_index_pair(bucket, f"rag_index/releases/{release_id}", staging / "release")
-        primary_db, primary_report = _index_pair_report(staging / "primary", primary_objects)
-        release_db, release_report = _index_pair_report(staging / "release", release_objects)
-
-        primary_urls = primary_db.get_indexed_urls()
-        release_urls = release_db.get_indexed_urls()
-        primary_chunk_ids = {chunk.chunk_id for chunk in primary_db._meta.values()}
-        release_chunk_ids = {chunk.chunk_id for chunk in release_db._meta.values()}
-        compatible = (
-            primary_report["valid"]
-            and release_report["valid"]
-            and primary_report["dimension"] == release_report["dimension"]
-            and primary_report["faiss_type"] == release_report["faiss_type"]
-            and primary_report["vector_count"] > 0
-            and release_report["vector_count"] > 0
-        )
-        report = {
-            "release_id": release_id,
-            "primary": primary_report,
-            "release": release_report,
-            "overlap": {
-                "source_urls": len(primary_urls & release_urls),
-                "chunk_ids": len(primary_chunk_ids & release_chunk_ids),
-                "release_urls_not_in_primary": len(release_urls - primary_urls),
-            },
-            "merge_safe": compatible,
-            "merge_refusal_reason": None if compatible else (
-                "The two saved pairs fail integrity checks, use different FAISS structures/dimensions, "
-                "or either index is empty. No merge may be attempted."
-            ),
-        }
-
-        # The caller needs independent in-memory databases after the temporary files disappear.
-        primary_db.save(str(staging / "primary-copy"))
-        release_db.save(str(staging / "release-copy"))
-        primary_copy = _open_saved_index(staging / "primary-copy")
-        release_copy = _open_saved_index(staging / "release-copy")
-        return primary_copy, release_copy, report
 
 
 def _download_system_prompt_from_gcs(bucket_name: str, config_dir: str) -> bool:
@@ -802,6 +653,10 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
         source_url = str(item.get("source_url") or _sync_source_url(source, source_id)).strip()
         if not source_url:
             raise ValueError("Each sync job item requires a source_url.")
+        item_status = str(item.get("initial_status") or _SYNC_ITEM_PENDING)
+        if item_status not in _SYNC_ITEM_STATUSES:
+            raise ValueError(f"Unsupported initial sync item status: {item_status}")
+        item_error = str(item.get("error") or "").strip()[:2000] or None
 
         item_data = {
             "source": source,
@@ -810,13 +665,13 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
             "source_url": source_url,
             "name": item.get("name", source_id),
             "created_time": item.get("created_time"),
-            "status": _SYNC_ITEM_PENDING,
+            "status": item_status,
             "attempts": 0,
             "next_attempt_at": None,
             "lease_expires_at": None,
             "started_at": None,
             "completed_at": None,
-            "error": None,
+            "error": item_error,
             "metadata": item.get("metadata", {}),
             "created_at": now,
             "updated_at": now,
@@ -829,19 +684,31 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
             "dedupe_key": dedupe_key,
             "job_id": job_id,
             "item_id": item_ref.id,
-            "status": _SYNC_ITEM_PENDING,
+            "status": item_status,
             "created_time": item.get("created_time"),
             "created_at": now,
             "updated_at": now,
+            "error": item_error,
         })
         batch.commit()
         added += 1
 
-    has_items = any(item_collection.limit(1).stream())
+    item_statuses = [item_doc.to_dict().get("status") for item_doc in item_collection.stream()]
+    has_runnable_items = any(
+        item_status in {_SYNC_ITEM_PENDING, _SYNC_ITEM_PROCESSING}
+        for item_status in item_statuses
+    )
+    has_failed_items = _SYNC_ITEM_FAILED in item_statuses
     job_ref.set({
-        "status": "queued" if has_items else "completed",
+        "status": (
+            "queued"
+            if has_runnable_items
+            else "completed_with_failures"
+            if has_failed_items
+            else "completed"
+        ),
         "updated_at": _sync_timestamp(),
-        "completed_at": _sync_timestamp() if not has_items else None,
+        "completed_at": _sync_timestamp() if not has_runnable_items else None,
     }, merge=True)
     return added
 
@@ -1100,33 +967,6 @@ def _pause_sync_job(job_id: str) -> dict:
         "paused_at": now,
         "updated_at": now,
     }, merge=True)
-    reset_items = 0
-    for item_doc in job_ref.collection("items").stream():
-        item = item_doc.to_dict() or {}
-        if item.get("status") == _SYNC_ITEM_COMPLETED:
-            continue
-        item_doc.reference.update({
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "next_attempt_at": None,
-            "lease_expires_at": None,
-            "started_at": None,
-            "completed_at": None,
-            "updated_at": now,
-            "error": None,
-            "worker_id": None,
-            "claim_token": None,
-        })
-        _sync_source_item_reference(
-            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-        ).set({
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "updated_at": now,
-            "error": None,
-        }, merge=True)
-        reset_items += 1
-    job_ref.set({"paused_reset_items": reset_items}, merge=True)
     return _sync_job_status(job_id)
 
 
@@ -1141,12 +981,61 @@ def _restart_sync_job(job_id: str) -> dict:
     if job.get("status") != _SYNC_JOB_PAUSED:
         raise HTTPException(status_code=409, detail="Pause the sync job before restarting it.")
 
+    processing_items = [
+        item_doc.id
+        for item_doc in job_ref.collection("items").where(
+            "status", "==", _SYNC_ITEM_PROCESSING
+        ).stream()
+    ]
+    if processing_items:
+        raise HTTPException(
+            status_code=409,
+            detail="Wait for the processing item to finish or fail before restarting this job.",
+        )
+
     now = _sync_timestamp()
+    restarted_items = 0
+    batch = db_fs.batch()
+    batch_operations = 0
+    for item_doc in job_ref.collection("items").where(
+        "status", "==", _SYNC_ITEM_FAILED
+    ).stream():
+        item = item_doc.to_dict() or {}
+        batch.update(item_doc.reference, {
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "next_attempt_at": None,
+            "lease_expires_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now,
+            "error": None,
+            "worker_id": None,
+            "claim_token": None,
+        })
+        batch.set(_sync_source_item_reference(
+            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+        ), {
+            "status": _SYNC_ITEM_PENDING,
+            "attempts": 0,
+            "updated_at": now,
+            "error": None,
+        }, merge=True)
+        restarted_items += 1
+        batch_operations += 2
+        if batch_operations >= 400:
+            batch.commit()
+            batch = db_fs.batch()
+            batch_operations = 0
+    if batch_operations:
+        batch.commit()
+
     job_ref.set({
         "status": "queued",
         "completed_at": None,
         "paused_at": None,
         "restarted_at": now,
+        "restarted_failed_items": restarted_items,
         "updated_at": now,
     }, merge=True)
     _wake_sync_worker()
@@ -1259,15 +1148,6 @@ def _serialized_index_mutation(handler):
     return wrapped
 
 
-def _serialized_index_recovery(handler):
-    """Serialize a verified recovery without requiring a previously healthy in-memory index."""
-    @functools.wraps(handler)
-    def wrapped(*args, **kwargs):
-        with _index_write_lock:
-            return handler(*args, **kwargs)
-    return wrapped
-
-
 def _process_gdrive_sync_item(item: dict) -> int:
     file_id = item["source_id"]
     file_name = Path(item.get("name") or file_id).name
@@ -1300,7 +1180,7 @@ def _process_blog_sync_item(item: dict) -> int:
     pdf_url = (metadata.get("pdf_url") or "").strip()
 
     def ingest_text() -> int:
-        content = (metadata.get("content") or "").strip()
+        content = _read_staged_sync_text(item, "blog")
         if not content:
             raise RuntimeError("Blog item has no indexable text content.")
         rag = _get_rag()
@@ -1358,7 +1238,7 @@ def _process_youtube_sync_item(item: dict) -> int:
 
 def _process_paste_sync_item(item: dict) -> int:
     metadata = item.get("metadata", {})
-    content = (metadata.get("content") or "").strip()
+    content = _read_staged_sync_text(item, "pasted text")
     if not content:
         raise RuntimeError("Pasted text item has no indexable content.")
 
@@ -1417,6 +1297,16 @@ def _delete_staged_sync_upload(item: dict) -> None:
         _sync_upload_bucket().blob(object_name).delete()
     except Exception:
         logger.warning("Could not delete staged upload %s after indexing", object_name, exc_info=True)
+
+
+def _read_staged_sync_text(item: dict, label: str) -> str:
+    object_name = str((item.get("metadata") or {}).get("object_name") or "").strip()
+    if not object_name:
+        raise RuntimeError(f"Queued {label} item is missing its staged text object.")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = Path(tmpdir) / "content.txt"
+        _sync_upload_bucket().blob(object_name).download_to_filename(str(local_path))
+        return local_path.read_text(encoding="utf-8").strip()
 
 
 def _process_file_sync_item(item: dict) -> int:
@@ -1528,6 +1418,8 @@ async def _sync_worker_loop() -> None:
                 )
                 if not completed:
                     logger.warning("Worker lost ownership before completing job=%s item=%s", job_id, item["id"])
+                elif item.get("source") in {"paste", "blogs"}:
+                    await asyncio.to_thread(_delete_staged_sync_upload, item)
             except Exception as exc:
                 logger.exception("Sync worker failed job=%s item=%s", job_id, item["id"])
                 failed = await asyncio.to_thread(
@@ -1623,19 +1515,33 @@ def _list_sync_jobs(limit: int = 20) -> list[dict]:
     return jobs
 
 
-def _list_sync_items(limit: int = 100) -> list[dict]:
-    from google.cloud.firestore import Query as FirestoreQuery
-
+def _list_sync_items(limit: int = 100, offset: int = 0) -> dict:
     db_fs = _sync_jobs_client()
     items = []
-    for item_doc in db_fs.collection_group("items").order_by(
-        "created_at", direction=FirestoreQuery.DESCENDING
-    ).limit(limit).stream():
-        item = item_doc.to_dict()
-        item["id"] = item_doc.id
-        item["job_id"] = item_doc.reference.parent.parent.id
-        items.append(item)
-    return items
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).stream():
+        for item_doc in job_doc.reference.collection("items").stream():
+            item = item_doc.to_dict()
+            item["id"] = item_doc.id
+            item["job_id"] = job_doc.id
+            items.append(item)
+
+    items.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("job_id") or ""),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    total = len(items)
+    page = items[offset:offset + limit]
+    return {
+        "items": page,
+        "total": total,
+        "has_more": offset + len(page) < total,
+        "offset": offset,
+        "next_offset": offset + len(page),
+    }
 
 
 def _load_model_from_firestore() -> Optional[str]:
@@ -1768,11 +1674,14 @@ def _scan_cleanup_candidates(db, req: CleanupRequest) -> tuple[list[int], list[d
 
     compiled: list = []
     if req.regex_enabled:
-        for p in req.regex_patterns:
+        for pattern_number, pattern in enumerate(req.regex_patterns, start=1):
             try:
-                compiled.append(_re.compile(p, _re.IGNORECASE))
-            except Exception:
-                pass
+                compiled.append(_re.compile(pattern, _re.IGNORECASE))
+            except _re.error as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid regex pattern #{pattern_number} ({pattern!r}): {exc}",
+                ) from exc
 
     flagged: list[int] = []
     samples: list[dict] = []
@@ -1860,11 +1769,6 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
-class IngestRequest(BaseModel):
-    url:     str
-    rebuild: bool = False
-
-
 class QueryRequest(BaseModel):
     question:        str
     top_k:           int           = Field(default=6, ge=1, le=20)
@@ -1893,6 +1797,29 @@ class RawDocumentsRequest(BaseModel):
     documents: list[RawDocumentItem]
 
 
+def _sync_preparation_failure(
+    source_id: str,
+    name: str,
+    error: str,
+    *,
+    source_url: str = "",
+    dedupe_key: Optional[str] = None,
+    created_time: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    failure_key = dedupe_key or source_id
+    return {
+        "source_id": source_id,
+        "dedupe_key": f"{failure_key}:preparation-failure",
+        "source_url": source_url,
+        "name": name or source_id,
+        "created_time": created_time,
+        "initial_status": _SYNC_ITEM_FAILED,
+        "error": error,
+        "metadata": metadata or {},
+    }
+
+
 class VideosIngestRequest(BaseModel):
     urls:    list[str]
     section: str = "video"
@@ -1909,10 +1836,6 @@ class CleanupRequest(BaseModel):
     regex_enabled:            bool        = False
     regex_patterns:           list[str]   = []
     section_filter:           Optional[str] = None
-
-
-class ReleaseCleanupRequest(BaseModel):
-    confirmation: str
 
 
 # ---------------------------------------------------------------------------
@@ -2513,6 +2436,7 @@ def set_system_prompt(body: dict, _: AdminDep):
     config_dir = Path("system_config")
     config_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = config_dir / "system_prompt.txt"
+    previous_prompt = prompt_file.read_bytes() if prompt_file.exists() else None
     try:
         prompt_file.write_text(prompt, encoding='utf-8')
         logger.info("System prompt saved to %s", prompt_file)
@@ -2525,7 +2449,17 @@ def set_system_prompt(body: dict, _: AdminDep):
     if bucket:
         ok = _upload_system_prompt_to_gcs(bucket, "system_config")
         if not ok:
-            logger.warning("Failed to upload system prompt to GCS, but local file saved.")
+            try:
+                if previous_prompt is None:
+                    prompt_file.unlink(missing_ok=True)
+                else:
+                    prompt_file.write_bytes(previous_prompt)
+            except Exception:
+                logger.exception("Failed to restore the prior local system prompt after GCS persistence failed.")
+            raise HTTPException(
+                status_code=503,
+                detail="System prompt was not saved because GCS persistence failed.",
+            )
 
     # Update in-memory variable
     from rag_query import load_system_prompt
@@ -2638,47 +2572,6 @@ def inspect_gcs_storage(
     }
 
 
-@app.delete("/admin/index-releases")
-@_serialized_index_recovery
-def delete_index_releases(body: ReleaseCleanupRequest, _: AdminDep):
-    """Delete obsolete release snapshots and their pointer, preserving primary and backups."""
-    if body.confirmation != "DELETE_RELEASE_SNAPSHOTS":
-        raise HTTPException(
-            status_code=400,
-            detail="Set confirmation to DELETE_RELEASE_SNAPSHOTS to delete only obsolete release snapshots.",
-        )
-
-    bucket_name = _current_config.get("gcs_bucket", "")
-    if not bucket_name:
-        raise HTTPException(status_code=503, detail="GCS_BUCKET is not configured.")
-
-    bucket = _gcs_client().bucket(bucket_name)
-    release_blobs = list(bucket.list_blobs(prefix="rag_index/releases/"))
-    for blob in release_blobs:
-        blob.reload()
-        blob.delete(if_generation_match=blob.generation)
-
-    manifest_blob = bucket.blob("rag_index/current.json")
-    deleted_manifest = False
-    if manifest_blob.exists():
-        manifest_blob.reload()
-        manifest_blob.delete(if_generation_match=manifest_blob.generation)
-        deleted_manifest = True
-
-    release_ids = {
-        blob.name.split("/")[2]
-        for blob in release_blobs
-        if len(blob.name.split("/")) >= 4
-    }
-    return {
-        "deleted_release_objects": len(release_blobs),
-        "deleted_release_count": len(release_ids),
-        "deleted_manifest": deleted_manifest,
-        "preserved_primary": [f"rag_index/{filename}" for filename in _GCS_INDEX_FILES],
-        "preserved_backups_prefix": "rag_index/recovery-backups/",
-    }
-
-
 @app.post("/config")
 def update_config(body: ConfigUpdate, _: AdminDep):
     global _rag, _current_config
@@ -2686,20 +2579,6 @@ def update_config(body: ConfigUpdate, _: AdminDep):
     _current_config.update(updates)
     _rag = None
     return {"updated": list(updates.keys()), "config": get_config(_)}
-
-
-@app.post("/ingest")
-@_serialized_index_mutation
-def ingest(body: IngestRequest, _: AdminDep):
-    rag = _get_rag()
-    if body.rebuild:
-        chunks = rag.rebuild_index(body.url)
-        action = "rebuild"
-    else:
-        chunks = rag.ingest_portfolio(body.url)
-        action = "ingest"
-    _save_and_sync(rag)
-    return {"action": action, "chunks_stored": chunks, "stats": rag.stats()}
 
 
 @app.get("/documents")
@@ -2742,14 +2621,14 @@ def get_document_chunks(doc_index: int, _: AdminDep):
     }
 
 
-@app.delete("/documents/{doc_title:path}")
+@app.delete("/documents/{doc_index}")
 @_serialized_index_mutation
-def delete_document(doc_title: str, _: AdminDep):
-    """Delete all chunks for a specific document title."""
+def delete_document(doc_index: int, _: AdminDep):
+    """Delete all chunks for one stable document index."""
     rag = _get_rag()
-    count = rag.db.delete_by_doc_title(doc_title)
+    count = rag.db.delete_by_doc_index(doc_index)
     _save_and_sync(rag)
-    return {"deleted_chunks": count, "title": doc_title}
+    return {"deleted_chunks": count, "doc_index": doc_index}
 
 
 # ---------------------------------------------------------------------------
@@ -2789,9 +2668,13 @@ def list_sync_jobs(_: AdminDep, limit: int = Query(20, ge=1, le=100)):
 
 
 @app.get("/sync-items")
-def list_sync_items(_: AdminDep, limit: int = Query(100, ge=1, le=500)):
+def list_sync_items(
+    _: AdminDep,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
     """Return the newest queue and processing-log items across every source."""
-    return {"items": _list_sync_items(limit)}
+    return _list_sync_items(limit=limit, offset=offset)
 
 
 @app.get("/sync-jobs/{job_id}")
@@ -2807,13 +2690,13 @@ def get_sync_job(
 
 @app.post("/sync-jobs/{job_id}/pause")
 def pause_sync_job(job_id: str, _: AdminDep):
-    """Reset unfinished work to pending and stop new claims for a sync job."""
+    """Stop new work claims while any active item finishes or fails normally."""
     return _pause_sync_job(job_id)
 
 
 @app.post("/sync-jobs/{job_id}/restart")
 def restart_sync_job(job_id: str, _: AdminDep):
-    """Resume a paused job after pause has reset its unfinished items."""
+    """Resume a paused job and requeue its terminally failed items."""
     return _restart_sync_job(job_id)
 
 
@@ -2911,12 +2794,17 @@ def ingest_folder(
 @app.post("/ingest/documents")
 def ingest_documents(body: RawDocumentsRequest, _: AdminDep):
     """Queue pasted text for durable background ingestion."""
+    if not body.documents:
+        raise HTTPException(status_code=400, detail="At least one pasted text document is required.")
+    if any(not document.content.strip() for document in body.documents):
+        raise HTTPException(status_code=400, detail="Pasted text content cannot be empty.")
+
+    job_id = _create_sync_job("paste", metadata={"submission": "paste_text"})
     items = []
+    preparation_failed = 0
     for document in body.documents:
         data = document.model_dump()
         content = data["content"].strip()
-        if not content:
-            raise HTTPException(status_code=400, detail="Pasted text content cannot be empty.")
         source_id = hashlib.sha256(
             json.dumps({
                 "title": data["title"],
@@ -2925,20 +2813,48 @@ def ingest_documents(body: RawDocumentsRequest, _: AdminDep):
                 "content": content,
             }, sort_keys=True).encode()
         ).hexdigest()
-        items.append({
-            "source_id": source_id,
-            "name": data["title"] or "Untitled",
-            "metadata": {**data, "content": content},
-        })
+        title = data["title"] or "Untitled"
+        source_url = data["url"] or _sync_source_url("paste", source_id)
+        try:
+            staged = _stage_sync_upload(
+                f"paste-{source_id}.txt",
+                content.encode("utf-8"),
+            )
+            items.append({
+                "source_id": source_id,
+                "source_url": source_url,
+                "name": title,
+                "metadata": {
+                    "title": title,
+                    "section": data["section"],
+                    "url": data["url"],
+                    "doc_type": data["doc_type"],
+                    "object_name": staged["metadata"]["object_name"],
+                },
+            })
+        except Exception as exc:
+            logger.exception("Could not stage pasted text for %s", title)
+            preparation_failed += 1
+            items.append(_sync_preparation_failure(
+                source_id,
+                title,
+                f"Could not stage pasted text: {exc}",
+                source_url=source_url,
+                metadata={"title": title, "section": data["section"]},
+            ))
 
-    job_id = _create_sync_job("paste", metadata={"submission": "paste_text"})
-    queued = _add_sync_job_items(job_id, "paste", items)
+    try:
+        queued = _add_sync_job_items(job_id, "paste", items)
+    except Exception:
+        logger.exception("Unable to queue pasted text items")
+        raise HTTPException(status_code=503, detail="Unable to queue pasted text items.")
     _wake_sync_worker()
     return {
         "action": "queue_paste_text",
         "job_id": job_id,
         "docs_received": len(items),
-        "queued": queued,
+        "queued": max(0, queued - preparation_failed),
+        "preparation_failed": preparation_failed,
     }
 
 
@@ -3027,25 +2943,65 @@ def clear_index(_: AdminDep):
 # YouTube PubSubHubbub  (automatic new-video ingestion)
 # ---------------------------------------------------------------------------
 
+def _youtube_pubsub_config() -> tuple[set[str], str]:
+    channel_ids = {
+        channel_id.strip()
+        for channel_id in os.environ.get("WATCHED_CHANNEL_IDS", "").split(",")
+        if channel_id.strip()
+    }
+    secret = os.environ.get("PUBSUB_SECRET", "").strip()
+    if not channel_ids:
+        raise HTTPException(status_code=503, detail="WATCHED_CHANNEL_IDS is not configured.")
+    if not secret:
+        raise HTTPException(status_code=503, detail="PUBSUB_SECRET is not configured.")
+    return channel_ids, secret
+
+
+def _youtube_channel_id_from_topic(topic: str) -> Optional[str]:
+    parsed = urlparse(topic)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "www.youtube.com"
+        or parsed.path != "/xml/feeds/videos.xml"
+    ):
+        return None
+    channel_ids = parse_qs(parsed.query).get("channel_id", [])
+    if len(channel_ids) != 1 or not channel_ids[0]:
+        return None
+    return channel_ids[0]
+
+
+def _youtube_notification_channel_id(root: ET.Element) -> Optional[str]:
+    atom_namespace = "{http://www.w3.org/2005/Atom}"
+    for link in root.findall(f"{atom_namespace}link"):
+        if link.attrib.get("rel") != "self":
+            continue
+        channel_id = _youtube_channel_id_from_topic(link.attrib.get("href", ""))
+        if channel_id:
+            return channel_id
+    return None
+
 @app.get("/youtube/notify")
 async def youtube_verify(
     hub_challenge: str = Query(..., alias="hub.challenge"),
     hub_topic: Optional[str] = Query(None, alias="hub.topic"),
 ):
     """YouTube calls this once on subscription to verify the endpoint is real."""
-    if hub_topic:
-        channel_id = hub_topic.rsplit("channel_id=", 1)[-1]
-        if channel_id and channel_id != hub_topic:
-            try:
-                _sync_jobs_client().collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
-                    "channel_id": channel_id,
-                    "topic": hub_topic,
-                    "status": "verified",
-                    "verified_at": _sync_timestamp(),
-                    "updated_at": _sync_timestamp(),
-                }, merge=True)
-            except Exception:
-                logger.exception("Unable to record YouTube subscription verification for %s", channel_id)
+    watched_channels, _ = _youtube_pubsub_config()
+    channel_id = _youtube_channel_id_from_topic(hub_topic or "")
+    if not channel_id or channel_id not in watched_channels:
+        raise HTTPException(status_code=403, detail="Unrecognized YouTube subscription topic.")
+    try:
+        _sync_jobs_client().collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
+            "channel_id": channel_id,
+            "topic": hub_topic,
+            "status": "verified",
+            "verified_at": _sync_timestamp(),
+            "updated_at": _sync_timestamp(),
+        }, merge=True)
+    except Exception as exc:
+        logger.exception("Unable to record YouTube subscription verification for %s", channel_id)
+        raise HTTPException(status_code=503, detail="Unable to record YouTube subscription verification.") from exc
     return PlainTextResponse(hub_challenge)
 
 
@@ -3055,19 +3011,21 @@ async def youtube_notify(request: Request):
     YouTube POSTs an Atom XML payload here within seconds of a new upload.
     It records video IDs durably and returns before background ingestion begins.
     """
+    watched_channels, secret = _youtube_pubsub_config()
     body = await request.body()
-
-    secret = os.environ.get("PUBSUB_SECRET", "")
-    if secret:
-        sig = request.headers.get("X-Hub-Signature", "")
-        expected = "sha1=" + hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            raise HTTPException(status_code=403, detail="Invalid signature")
+    signature = request.headers.get("X-Hub-Signature", "")
+    expected = "sha1=" + hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:
         root = ET.fromstring(body)
     except ET.ParseError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid YouTube notification XML: {exc}")
+
+    channel_id = _youtube_notification_channel_id(root)
+    if not channel_id or channel_id not in watched_channels:
+        raise HTTPException(status_code=403, detail="Notification is not for a configured YouTube channel.")
 
     ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
     atom_namespace = "{http://www.w3.org/2005/Atom}"
@@ -3115,24 +3073,19 @@ def youtube_resubscribe(request: Request):
     """
     
 
-    channel_ids = [
-        c.strip()
-        for c in os.environ.get("WATCHED_CHANNEL_IDS", "").split(",")
-        if c.strip()
-    ]
-    if not channel_ids:
-        return {"resubscribed": [], "warning": "WATCHED_CHANNEL_IDS not set"}
+    channel_ids, secret = _youtube_pubsub_config()
 
     callback = str(request.base_url).rstrip("/") + "/youtube/notify"
-    secret   = os.environ.get("PUBSUB_SECRET", "")
-
-    results = []
-    db_fs = None
     try:
         db_fs = _sync_jobs_client()
-    except Exception:
+    except Exception as exc:
         logger.exception("Unable to initialize Firestore for YouTube subscription tracking")
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube subscriptions cannot be requested while the queue is unavailable.",
+        ) from exc
 
+    results = []
     for cid in channel_ids:
         topic = f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={cid}"
         data  = {
@@ -3141,8 +3094,7 @@ def youtube_resubscribe(request: Request):
             "hub.callback":      callback,
             "hub.lease_seconds": 2592000,   # 30 days (YouTube's max)
         }
-        if secret:
-            data["hub.secret"] = secret
+        data["hub.secret"] = secret
         try:
             resp = _req.post("https://pubsubhubbub.appspot.com/subscribe", data=data, timeout=15)
             request_status = "requested" if resp.status_code == 202 else "rejected"
@@ -3153,20 +3105,23 @@ def youtube_resubscribe(request: Request):
 
         results.append(result)
         logger.info("PubSubHubbub subscribe: channel=%s status=%s", cid, result["status"])
-        if db_fs is not None:
-            try:
-                db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(cid).set({
-                    "channel_id": cid,
-                    "topic": topic,
-                    "callback": callback,
-                    "status": result["status"],
-                    "http_status": result.get("http_status"),
-                    "error": result.get("error"),
-                    "requested_at": _sync_timestamp(),
-                    "updated_at": _sync_timestamp(),
-                }, merge=True)
-            except Exception:
-                logger.exception("Unable to record YouTube subscription request for %s", cid)
+        try:
+            db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(cid).set({
+                "channel_id": cid,
+                "topic": topic,
+                "callback": callback,
+                "status": result["status"],
+                "http_status": result.get("http_status"),
+                "error": result.get("error"),
+                "requested_at": _sync_timestamp(),
+                "updated_at": _sync_timestamp(),
+            }, merge=True)
+        except Exception as exc:
+            logger.exception("Unable to record YouTube subscription request for %s", cid)
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to record YouTube subscription request.",
+            ) from exc
 
     return {"resubscribed": results}
 
@@ -3391,25 +3346,65 @@ def blogs_sync():
         metadata={"cms_api": api_url},
     )
     items = []
+    preparation_failed = 0
     for blog, blog_datetime in new_blogs:
         blog_id = str(blog["id"])
         title = blog.get("name") or "Untitled Blog"
+        dedupe_key = f"{blog_id}:{blog_datetime.isoformat()}"
         content = "\n\n".join(filter(None, [
             (blog.get("subDescription") or "").strip(),
             (blog.get("description") or "").strip(),
         ])).strip()
-        items.append({
-            "source_id": blog_id,
-            "dedupe_key": f"{blog_id}:{blog_datetime.isoformat()}",
-            "name": title,
-            "created_time": blog_datetime.isoformat(),
-            "metadata": {
-                "title": title,
-                "content": content,
-                "pdf_url": (blog.get("document") or "").strip(),
-                "updated_time": blog_datetime.isoformat(),
-            },
-        })
+        pdf_url = (blog.get("document") or "").strip()
+        metadata = {
+            "title": title,
+            "pdf_url": pdf_url,
+            "updated_time": blog_datetime.isoformat(),
+        }
+        if pdf_url:
+            items.append({
+                "source_id": blog_id,
+                "dedupe_key": dedupe_key,
+                "name": title,
+                "created_time": blog_datetime.isoformat(),
+                "metadata": metadata,
+            })
+            continue
+        if not content:
+            preparation_failed += 1
+            items.append(_sync_preparation_failure(
+                blog_id,
+                title,
+                "Blog has neither a PDF URL nor indexable text content.",
+                dedupe_key=dedupe_key,
+                created_time=blog_datetime.isoformat(),
+                metadata=metadata,
+            ))
+            continue
+        try:
+            staged = _stage_sync_upload(
+                f"blog-{blog_id}.txt",
+                content.encode("utf-8"),
+            )
+            metadata["object_name"] = staged["metadata"]["object_name"]
+            items.append({
+                "source_id": blog_id,
+                "dedupe_key": dedupe_key,
+                "name": title,
+                "created_time": blog_datetime.isoformat(),
+                "metadata": metadata,
+            })
+        except Exception as exc:
+            logger.exception("Could not stage blog text for %s", blog_id)
+            preparation_failed += 1
+            items.append(_sync_preparation_failure(
+                blog_id,
+                title,
+                f"Could not stage blog text: {exc}",
+                dedupe_key=dedupe_key,
+                created_time=blog_datetime.isoformat(),
+                metadata=metadata,
+            ))
 
     try:
         queued = _add_sync_job_items(job_id, "blogs", items)
@@ -3424,7 +3419,8 @@ def blogs_sync():
     _wake_sync_worker()
     return {
         "job_id": job_id,
-        "queued": queued,
+        "queued": max(0, queued - preparation_failed),
+        "preparation_failed": preparation_failed,
         "discovered": len(new_blogs),
         "last_sync_time": last_sync_time,
         "next_sync_after": newest_timestamp.isoformat(),
