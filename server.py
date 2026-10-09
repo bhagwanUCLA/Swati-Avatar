@@ -3118,7 +3118,7 @@ def _youtube_notification_channel_id(root: ET.Element) -> Optional[str]:
 
 
 def _youtube_callback_url(request: Request) -> str:
-    return str(request.base_url).rstrip("/") + "/youtube/notify"
+    return str(request.base_url.replace(scheme="https")).rstrip("/") + "/youtube/notify"
 
 
 def _request_youtube_subscription(
@@ -3161,16 +3161,48 @@ def _request_youtube_subscription(
 
 @app.get("/youtube/notify")
 async def youtube_verify(
-    hub_challenge: str = Query(..., alias="hub.challenge"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
     hub_topic: Optional[str] = Query(None, alias="hub.topic"),
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_reason: Optional[str] = Query(None, alias="hub.reason"),
 ):
     """YouTube calls this once on subscription to verify the endpoint is real."""
     watched_channels, _ = _youtube_pubsub_config()
     channel_id = _youtube_channel_id_from_topic(hub_topic or "")
     if not channel_id or channel_id not in watched_channels:
         raise HTTPException(status_code=403, detail="Unrecognized YouTube subscription topic.")
+    if hub_mode == "denied":
+        try:
+            db_fs = _sync_jobs_client()
+            now = _sync_timestamp()
+            db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
+                "status": "denied",
+                "error": hub_reason or "The Hub denied the subscription.",
+                "updated_at": now,
+            }, merge=True)
+            test_channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
+            if test_channel_ref.get().exists:
+                test_channel_ref.set({
+                    "status": "denied",
+                    "error": hub_reason or "The Hub denied the subscription.",
+                    "updated_at": now,
+                }, merge=True)
+        except Exception as exc:
+            logger.exception("Unable to record YouTube subscription denial for %s", channel_id)
+            raise HTTPException(status_code=503, detail="Unable to record YouTube subscription denial.") from exc
+        return Response(status_code=204)
+    if hub_mode not in {"subscribe", "unsubscribe"} or not hub_challenge:
+        raise HTTPException(status_code=400, detail="Unrecognized YouTube subscription mode.")
     try:
         db_fs = _sync_jobs_client()
+        test_channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
+        if hub_mode == "unsubscribe" and test_channel_ref.get().exists:
+            batch = db_fs.batch()
+            batch.delete(test_channel_ref)
+            batch.delete(db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id))
+            batch.commit()
+            return PlainTextResponse(hub_challenge)
+
         db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
             "channel_id": channel_id,
             "topic": hub_topic,
@@ -3178,7 +3210,6 @@ async def youtube_verify(
             "verified_at": _sync_timestamp(),
             "updated_at": _sync_timestamp(),
         }, merge=True)
-        test_channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
         if test_channel_ref.get().exists:
             test_channel_ref.set({
                 "status": "verified",
@@ -3202,45 +3233,70 @@ async def youtube_notify(request: Request):
     signature = request.headers.get("X-Hub-Signature", "")
     expected = "sha1=" + hmac.new(secret.encode(), body, hashlib.sha1).hexdigest()
     if not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=403, detail="Invalid signature")
+        logger.warning("Ignored YouTube notification with an invalid HMAC signature.")
+        return Response(status_code=204)
 
     try:
         root = ET.fromstring(body)
     except ET.ParseError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid YouTube notification XML: {exc}")
 
-    channel_id = _youtube_notification_channel_id(root)
-    if not channel_id or channel_id not in watched_channels:
-        raise HTTPException(status_code=403, detail="Notification is not for a configured YouTube channel.")
-
     ns = {"yt": "http://www.youtube.com/xml/schemas/2015"}
     atom_namespace = "{http://www.w3.org/2005/Atom}"
     items = []
+    notification_channels = set()
+    feed_channel_id = _youtube_notification_channel_id(root)
 
     for entry in root.iter(f"{atom_namespace}entry"):
         vid_el = entry.find("yt:videoId", ns)
-        if vid_el is not None and vid_el.text:
-            video_id = vid_el.text.strip()
-            if not video_id:
-                continue
-            title = entry.findtext(f"{atom_namespace}title") or video_id
-            published_at = (
-                entry.findtext(f"{atom_namespace}published")
-                or entry.findtext(f"{atom_namespace}updated")
-            )
-            items.append({
-                "source_id": video_id,
-                "name": title.strip(),
-                "created_time": published_at,
-                "metadata": {"title": title.strip()},
-            })
+        if vid_el is None or not vid_el.text:
+            continue
+        channel_id = (entry.findtext("yt:channelId", namespaces=ns) or feed_channel_id or "").strip()
+        if channel_id not in watched_channels:
+            logger.warning("Ignored YouTube notification entry for an unconfigured channel.")
+            continue
+        video_id = vid_el.text.strip()
+        if not video_id:
+            continue
+        title = entry.findtext(f"{atom_namespace}title") or video_id
+        published_at = (
+            entry.findtext(f"{atom_namespace}published")
+            or entry.findtext(f"{atom_namespace}updated")
+        )
+        items.append({
+            "source_id": video_id,
+            "name": title.strip(),
+            "created_time": published_at,
+            "metadata": {"title": title.strip(), "channel_id": channel_id},
+        })
+        notification_channels.add(channel_id)
 
     if not items:
+        logger.info("YouTube notification contained no entries for configured channels.")
         return Response(status_code=204)
 
     try:
         job_id = _create_sync_job("youtube", metadata={"notification_received_at": _sync_timestamp()})
         queued = _add_sync_job_items(job_id, "youtube", items)
+        db_fs = _sync_jobs_client()
+        now = _sync_timestamp()
+        for channel_id in notification_channels:
+            notification_state = {
+                "last_notification_at": now,
+                "last_notification_video_ids": [
+                    item["source_id"] for item in items
+                    if item["metadata"]["channel_id"] == channel_id
+                ],
+                "last_notification_job_id": job_id,
+                "last_notification_queued": queued,
+                "updated_at": now,
+            }
+            db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set(
+                notification_state, merge=True
+            )
+            test_channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
+            if test_channel_ref.get().exists:
+                test_channel_ref.set(notification_state, merge=True)
     except Exception:
         logger.exception("Unable to queue YouTube notification items")
         raise HTTPException(status_code=503, detail="Unable to queue YouTube notification.")
@@ -3368,9 +3424,27 @@ def delete_youtube_test_channel(channel_id: str, request: Request, _: AdminDep):
         "unsubscribe",
     )
     try:
+        subscription_ref = db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(
+            normalized_channel_id
+        )
+        if result["status"] == "unsubscribe_requested":
+            now = _sync_timestamp()
+            channel_ref.set({
+                "status": "unsubscribe_requested",
+                "updated_at": now,
+                "error": None,
+            }, merge=True)
+            subscription_ref.set({
+                "status": "unsubscribe_requested",
+                "http_status": result.get("http_status"),
+                "updated_at": now,
+                "error": None,
+            }, merge=True)
+            return {"removed": False, "removal_pending": True, "test_channel": result}
+
         batch = db_fs.batch()
         batch.delete(channel_ref)
-        batch.delete(db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(normalized_channel_id))
+        batch.delete(subscription_ref)
         batch.commit()
     except Exception as exc:
         logger.exception("Unable to delete temporary YouTube test channel %s", normalized_channel_id)
@@ -3388,7 +3462,7 @@ def youtube_resubscribe(request: Request):
 
     channel_ids, secret = _youtube_pubsub_config()
 
-    callback = str(request.base_url).rstrip("/") + "/youtube/notify"
+    callback = _youtube_callback_url(request)
     try:
         db_fs = _sync_jobs_client()
     except Exception as exc:
