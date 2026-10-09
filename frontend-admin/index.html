@@ -144,7 +144,6 @@
   .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
   .stat-val   { font-size: 20px; font-weight: 600; }
 
-  .section-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
   .sec-pill {
     font-size: 11px; padding: 3px 10px; border-radius: 20px;
     border: 1px solid var(--border2); cursor: pointer;
@@ -319,19 +318,20 @@
   .sync-job-count { padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 11px; white-space: nowrap; }
   .sync-job-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); }
   .sync-job-items { border-top: 1px solid var(--border); max-height: 360px; overflow-y: auto; }
-  .sync-job-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; gap: 8px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .sync-job-item { display: grid; grid-template-columns: minmax(0, 1fr) 72px 82px 90px 96px; gap: 8px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
   .sync-job-item:last-child { border-bottom: none; }
-  .sync-job-item-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+  .sync-job-item-head { display: grid; grid-template-columns: minmax(0, 1fr) 72px 82px 90px 96px; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
   .sync-job-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sync-status { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
   .sync-status.pending { color: var(--blue); }
+  .sync-status.paused { color: var(--muted); }
   .sync-status.processing { color: var(--accent); }
   .sync-status.completed { color: var(--green); }
   .sync-status.failed { color: var(--red); }
   .sync-job-error { grid-column: 1 / -1; color: var(--red); font-family: var(--mono); font-size: 10px; white-space: pre-wrap; word-break: break-word; }
   @media (max-width: 600px) {
     .sync-job-counts { margin-left: 0; width: 100%; }
-    .sync-job-item, .sync-job-item-head { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .sync-job-item, .sync-job-item-head { grid-template-columns: minmax(0, 1fr) 72px 82px; }
     .sync-job-item-head span:nth-child(4), .sync-job-item-head span:nth-child(5) { display: none; }
     .sync-job-item > :nth-child(4) { display: none; }
     .sync-job-item .btn { grid-column: 1 / -1; justify-self: start; }
@@ -629,10 +629,15 @@
         <div>
           <div class="card-title" style="margin:0">Scheduled Queue &amp; Activity</div>
           <div id="sync-jobs-total-label" style="font-size:12px;color:var(--muted);margin-top:2px"></div>
+          <div id="sync-queue-state" style="font-size:12px;color:var(--muted);margin-top:2px"></div>
         </div>
-        <button class="btn btn-sm" onclick="refreshSyncJobs()">↺ Refresh</button>
+        <div class="btn-group" style="margin:0">
+          <button class="btn btn-sm" id="sync-start-btn" style="display:none" onclick="startSyncQueue()">Start Queue</button>
+          <button class="btn btn-sm" id="sync-pause-btn" style="display:none" onclick="pauseSyncQueue()">Pause Queue</button>
+          <button class="btn btn-sm" onclick="refreshSyncJobs()">↺ Refresh</button>
+        </div>
       </div>
-      <p class="hint">Newest items appear first. This is one shared queue and activity log; source identifies where each item came from.</p>
+      <p class="hint">Newest items appear first. This is one shared queue and activity log; source identifies where each item came from. A deployment pauses unfinished work; choose Start Queue to resume it.</p>
       <div id="sync-jobs-status" class="chats-status" style="display:none"></div>
       <div id="sync-jobs-list"></div>
       <div class="btn-group" style="margin-top:14px;justify-content:center">
@@ -649,7 +654,6 @@
         <div class="stat-box"><div class="stat-label">Total docs</div><div class="stat-val" id="st-docs">—</div></div>
         <div class="stat-box"><div class="stat-label">Total chunks</div><div class="stat-val" id="st-chunks">—</div></div>
       </div>
-      <div class="section-bar" id="section-bar"></div>
       <hr>
       <div class="card-title">Documents</div>
       <div id="doc-list" style="max-height:400px;overflow-y:auto;font-size:12px;color:var(--muted)"></div>
@@ -1300,7 +1304,7 @@ function simpleMd(text) {
 }
 
 // ── SYNC JOBS ───────────────────────────────────────────────────────────
-const SYNC_JOBS_REFRESH_MS = 10_000;
+const SYNC_JOBS_REFRESH_MS = 15_000;
 const SYNC_ITEMS_PAGE_SIZE = 50;
 let syncJobsRefreshTimer = null;
 let syncJobsLoading = false;
@@ -1339,9 +1343,13 @@ async function loadSyncJobs(reset = true) {
     : SYNC_ITEMS_PAGE_SIZE;
 
   try {
-    const response = await authFetch(`${API}/sync-items?limit=${limit}&offset=${offset}`);
-    if (!response.ok) throw new Error(await syncJobError(response));
-    const data = await response.json();
+    const [itemsResponse, queueResponse] = await Promise.all([
+      authFetch(`${API}/sync-items?limit=${limit}&offset=${offset}`),
+      authFetch(`${API}/sync-queue/status`),
+    ]);
+    if (!itemsResponse.ok) throw new Error(await syncJobError(itemsResponse));
+    if (!queueResponse.ok) throw new Error(await syncJobError(queueResponse));
+    const [data, queue] = await Promise.all([itemsResponse.json(), queueResponse.json()]);
     const page = data.items || [];
     syncItems = reset ? page : syncItems.concat(page);
     syncItemsTotal = data.total || 0;
@@ -1350,6 +1358,7 @@ async function loadSyncJobs(reset = true) {
       ? renderSyncItemList(syncItems)
       : '<div style="padding:20px;text-align:center;color:var(--muted)">No scheduled items yet.</div>';
     totalLabel.textContent = `${syncItems.length} of ${syncItemsTotal} item${syncItemsTotal !== 1 ? 's' : ''}`;
+    renderSyncQueueControls(queue);
     moreBtn.style.display = data.has_more ? 'inline-flex' : 'none';
     statusEl.style.display = 'none';
   } catch (error) {
@@ -1363,7 +1372,7 @@ async function loadSyncJobs(reset = true) {
 
 function renderSyncItemList(items) {
   const itemsHtml = items.map(item => {
-    const canRemove = item.status === 'pending' || item.status === 'failed';
+    const canRemove = ['paused', 'pending', 'failed'].includes(item.status);
     return `
       <div class="sync-job-item">
         <span class="sync-job-item-name">${esc(item.name || item.source_id)}</span>
@@ -1378,7 +1387,7 @@ function renderSyncItemList(items) {
   return `
     <section class="sync-job-card">
       <div class="sync-job-item-head">
-        <span>Item</span><span>Source</span><span>Status</span><span>Attempts</span><span></span>
+        <span>Item</span><span>Source</span><span>Status</span><span>Attempts</span><span>Action</span>
       </div>
       <div class="sync-job-items">${itemsHtml}</div>
     </section>`;
@@ -1389,24 +1398,8 @@ async function syncJobError(response) {
   return data.detail || response.statusText || `HTTP ${response.status}`;
 }
 
-async function runSyncJobAction(jobId, action) {
-  const labels = {
-    pause: 'Pause this job and reset every unfinished item to pending?',
-    restart: 'Restart this paused job?',
-  };
-  if (!confirm(labels[action])) return;
-
-  try {
-    const response = await authFetch(`${API}/sync-jobs/${encodeURIComponent(jobId)}/${action}`, { method: 'POST' });
-    if (!response.ok) throw new Error(await syncJobError(response));
-    await loadSyncJobs();
-  } catch (error) {
-    alert(`Sync job action failed: ${error.message}`);
-  }
-}
-
 async function removeSyncJobItem(jobId, itemId) {
-  if (!confirm('Remove this pending or failed item without processing it?')) return;
+  if (!confirm('Remove this paused, pending, or failed item without processing it?')) return;
   try {
     const response = await authFetch(
       `${API}/sync-jobs/${encodeURIComponent(jobId)}/items/${encodeURIComponent(itemId)}`,
@@ -1416,6 +1409,39 @@ async function removeSyncJobItem(jobId, itemId) {
     await loadSyncJobs();
   } catch (error) {
     alert(`Could not remove item: ${error.message}`);
+  }
+}
+
+function renderSyncQueueControls(queue) {
+  const stateEl = document.getElementById('sync-queue-state');
+  const startBtn = document.getElementById('sync-start-btn');
+  const pauseBtn = document.getElementById('sync-pause-btn');
+  const counts = queue.counts || {};
+  const isRunning = queue.state === 'running';
+  stateEl.textContent = `Queue ${isRunning ? 'running' : 'paused'} · paused: ${counts.paused || 0}, pending: ${counts.pending || 0}, processing: ${counts.processing || 0}, failed: ${counts.failed || 0}, completed: ${counts.completed || 0}`;
+  startBtn.style.display = isRunning ? 'none' : 'inline-flex';
+  pauseBtn.style.display = isRunning ? 'inline-flex' : 'none';
+}
+
+async function pauseSyncQueue() {
+  if (!confirm('Pause the queue? Pending and failed items will pause; an item already processing will finish or fail safely.')) return;
+  try {
+    const response = await authFetch(`${API}/sync-queue/pause`, { method: 'POST' });
+    if (!response.ok) throw new Error(await syncJobError(response));
+    await refreshSyncJobs();
+  } catch (error) {
+    alert(`Could not pause queue: ${error.message}`);
+  }
+}
+
+async function startSyncQueue() {
+  if (!confirm('Start the queue and resume all paused items?')) return;
+  try {
+    const response = await authFetch(`${API}/sync-queue/start`, { method: 'POST' });
+    if (!response.ok) throw new Error(await syncJobError(response));
+    await refreshSyncJobs();
+  } catch (error) {
+    alert(`Could not start queue: ${error.message}`);
   }
 }
 
@@ -1522,15 +1548,6 @@ async function loadIndex() {
     const s = await res.json();
     document.getElementById('st-chunks').textContent  = (s.total_chunks   || 0).toLocaleString();
     document.getElementById('st-docs').textContent    = (s.total_documents|| 0).toLocaleString();
-
-    const secBar = document.getElementById('section-bar');
-    secBar.innerHTML = '';
-    Object.entries(s.sections || {}).sort((a,b) => b[1]-a[1]).forEach(([sec, cnt]) => {
-      const p = document.createElement('span');
-      p.className = 'sec-pill';
-      p.textContent = `${sec} (${cnt})`;
-      secBar.appendChild(p);
-    });
 
     // Load actual document list
     const dres = await authFetch(API + '/documents');

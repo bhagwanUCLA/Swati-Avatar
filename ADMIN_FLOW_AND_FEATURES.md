@@ -70,26 +70,26 @@ Each Scheduled Jobs row shows:
 
 - **Item** — file name, pasted-text title, blog title, or submitted video URL.
 - **Source** — `paste`, `files`, `videos`, `gdrive`, `blogs`, or `youtube`.
-- **Status** — `pending`, `processing`, `completed`, or `failed`.
+- **Status** — `paused`, `pending`, `processing`, `completed`, or `failed`.
 - **Attempts** — how many times the worker has claimed the item.
-- **Remove** — available only for pending or failed items.
+- **Remove** — available only for paused, pending, or failed items.
 
 ### Item Lifecycle
 
 ```text
-pending → processing → completed
-                    └→ pending (automatic retry while attempts remain)
-                    └→ failed  (after the retry limit)
+paused → pending → processing → completed
+                  └→ pending (automatic retry while attempts remain)
+                  └→ failed  (after the retry limit)
 ```
 
 Completed and failed records remain in Firestore as activity history. Only `pending`
 items are eligible for processing. The worker processes one item at a time.
 
-The backend has job-level pause and restart APIs for operational recovery:
-
-- `POST /sync-jobs/{job_id}/pause` keeps completed items but resets every unfinished
-  item (`pending`, `processing`, or `failed`) to `pending` and pauses the job.
-- `POST /sync-jobs/{job_id}/restart` resumes a paused job and wakes the worker.
+The queue has one persisted global state. On every backend start or deployment, all
+unfinished items are moved to `paused` and the worker remains stopped. **Start Queue**
+changes paused items to pending and enables the worker. **Pause Queue** stops new
+claims, moves pending and failed items to paused, and lets an already-processing item
+finish or fail normally. Completed items are never changed by either action.
 
 The flat Scheduled Jobs interface intentionally does not group or display items by job.
 
@@ -97,12 +97,13 @@ The flat Scheduled Jobs interface intentionally does not group or display items 
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /sync-items?limit=500` | Newest-first flat list used by Scheduled Jobs. |
+| `GET /sync-items?limit=500&offset=0` | Paginated newest-first flat list used by Scheduled Jobs. |
+| `GET /sync-queue/status` | Global queue state and counts by item status. |
+| `POST /sync-queue/pause` | Pause future claims and pause pending/failed items. |
+| `POST /sync-queue/start` | Resume all paused items and start the worker. |
 | `GET /sync-jobs` | Internal/recovery-oriented list of job records. |
 | `GET /sync-jobs/{job_id}` | One job and its item records. |
-| `POST /sync-jobs/{job_id}/pause` | Pause new claims while an active item finishes or fails. |
-| `POST /sync-jobs/{job_id}/restart` | Resume a paused job and requeue failed items. |
-| `DELETE /sync-jobs/{job_id}/items/{item_id}` | Remove a pending or failed item. |
+| `DELETE /sync-jobs/{job_id}/items/{item_id}` | Remove a paused, pending, or failed item. |
 
 ## Manual Ingestion
 

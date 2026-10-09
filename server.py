@@ -436,17 +436,22 @@ _GDRIVE_SERVICE_CACHE_TTL = 3600  # 1 hour
 _SYNC_JOBS_COLLECTION = "sync_jobs"
 _SYNC_SOURCE_ITEMS_COLLECTION = "sync_source_items"
 _YOUTUBE_SUBSCRIPTIONS_COLLECTION = "youtube_subscriptions"
+_SYNC_QUEUE_CONTROL_COLLECTION = "system_config"
+_SYNC_QUEUE_CONTROL_DOCUMENT = "sync_queue"
 _SYNC_JOB_SOURCES = {"gdrive", "blogs", "youtube", "paste", "files", "videos"}
 _SYNC_ITEM_PENDING = "pending"
 _SYNC_ITEM_PROCESSING = "processing"
 _SYNC_ITEM_COMPLETED = "completed"
 _SYNC_ITEM_FAILED = "failed"
-_SYNC_JOB_PAUSED = "paused"
+_SYNC_ITEM_PAUSED = "paused"
+_SYNC_QUEUE_RUNNING = "running"
+_SYNC_QUEUE_PAUSED = "paused"
 _SYNC_ITEM_STATUSES = {
     _SYNC_ITEM_PENDING,
     _SYNC_ITEM_PROCESSING,
     _SYNC_ITEM_COMPLETED,
     _SYNC_ITEM_FAILED,
+    _SYNC_ITEM_PAUSED,
 }
 _SYNC_PROCESSING_LEASE_SECONDS = 900
 _SYNC_MAX_ATTEMPTS = 2
@@ -566,6 +571,172 @@ def _sync_jobs_client():
     return _firestore_client()
 
 
+def _sync_queue_control_reference(db_fs):
+    return db_fs.collection(_SYNC_QUEUE_CONTROL_COLLECTION).document(_SYNC_QUEUE_CONTROL_DOCUMENT)
+
+
+def _sync_queue_state(db_fs) -> str:
+    queue_doc = _sync_queue_control_reference(db_fs).get()
+    state = (queue_doc.to_dict() or {}).get("state") if queue_doc.exists else None
+    return state if state in {_SYNC_QUEUE_RUNNING, _SYNC_QUEUE_PAUSED} else _SYNC_QUEUE_PAUSED
+
+
+def _sync_queue_is_runnable(db_fs) -> bool:
+    queue_doc = _sync_queue_control_reference(db_fs).get()
+    queue = (queue_doc.to_dict() or {}) if queue_doc.exists else {}
+    return queue.get("state") == _SYNC_QUEUE_RUNNING and not queue.get("resuming", False)
+
+
+def _sync_queue_status() -> dict:
+    """Return the persisted global queue state and counts across all job items."""
+    db_fs = _sync_jobs_client()
+    counts = {item_status: 0 for item_status in _SYNC_ITEM_STATUSES}
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).stream():
+        for item_doc in job_doc.reference.collection("items").stream():
+            item_status = (item_doc.to_dict() or {}).get("status")
+            if item_status in counts:
+                counts[item_status] += 1
+    return {
+        "state": _sync_queue_state(db_fs),
+        "counts": counts,
+        "worker_running": bool(_sync_worker_task and not _sync_worker_task.done()),
+    }
+
+
+def _set_sync_queue_paused(*, startup: bool = False) -> int:
+    """Pause future claims and mark non-active queued work as paused.
+
+    A currently processing item is deliberately untouched during an operator pause so
+    it can finish its already-started index mutation safely. Startup has no live
+    worker to preserve, so stale processing records are paused as requested.
+    """
+    db_fs = _sync_jobs_client()
+    now = _sync_timestamp()
+    queue_ref = _sync_queue_control_reference(db_fs)
+    queue_ref.set({
+        "state": _SYNC_QUEUE_PAUSED,
+        "resuming": False,
+        "updated_at": now,
+        "paused_at": now,
+        "pause_reason": "startup" if startup else "admin",
+    }, merge=True)
+
+    pausable_statuses = {_SYNC_ITEM_PENDING, _SYNC_ITEM_FAILED}
+    if startup:
+        pausable_statuses.add(_SYNC_ITEM_PROCESSING)
+
+    changed = 0
+    batch = db_fs.batch()
+    operations = 0
+    affected_jobs = set()
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).stream():
+        for item_doc in job_doc.reference.collection("items").stream():
+            item = item_doc.to_dict() or {}
+            previous_status = item.get("status")
+            if previous_status not in pausable_statuses:
+                continue
+            item_update = {
+                "status": _SYNC_ITEM_PAUSED,
+                "paused_from_status": previous_status,
+                "paused_at": now,
+                "next_attempt_at": None,
+                "lease_expires_at": None,
+                "claim_token": None,
+                "worker_id": None,
+                "updated_at": now,
+            }
+            batch.update(item_doc.reference, item_update)
+            batch.set(_sync_source_item_reference(
+                db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+            ), {
+                "status": _SYNC_ITEM_PAUSED,
+                "updated_at": now,
+            }, merge=True)
+            changed += 1
+            operations += 2
+            affected_jobs.add(job_doc.id)
+            if operations >= 400:
+                batch.commit()
+                batch = db_fs.batch()
+                operations = 0
+    if operations:
+        batch.commit()
+
+    for job_id in affected_jobs:
+        db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).set({
+            "status": "queued",
+            "completed_at": None,
+            "updated_at": now,
+        }, merge=True)
+    return changed
+
+
+def _start_sync_queue() -> int:
+    """Requeue all paused items, then enable claims for the shared worker."""
+    _ensure_index_storage_ready()
+    db_fs = _sync_jobs_client()
+    now = _sync_timestamp()
+    _sync_queue_control_reference(db_fs).set({
+        "state": _SYNC_QUEUE_PAUSED,
+        "resuming": True,
+        "updated_at": now,
+    }, merge=True)
+    restarted = 0
+    batch = db_fs.batch()
+    operations = 0
+    affected_jobs = set()
+    for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).stream():
+        for item_doc in job_doc.reference.collection("items").where(
+            "status", "==", _SYNC_ITEM_PAUSED
+        ).stream():
+            item = item_doc.to_dict() or {}
+            was_failed = item.get("paused_from_status") == _SYNC_ITEM_FAILED
+            batch.update(item_doc.reference, {
+                "status": _SYNC_ITEM_PENDING,
+                "paused_from_status": None,
+                "paused_at": None,
+                "next_attempt_at": None,
+                "lease_expires_at": None,
+                "claim_token": None,
+                "worker_id": None,
+                "updated_at": now,
+                "error": None,
+                "attempts": 0 if was_failed else int(item.get("attempts", 0)),
+            })
+            batch.set(_sync_source_item_reference(
+                db_fs, item["source"], item["source_id"], item.get("dedupe_key")
+            ), {
+                "status": _SYNC_ITEM_PENDING,
+                "updated_at": now,
+                "error": None,
+                "attempts": 0 if was_failed else int(item.get("attempts", 0)),
+            }, merge=True)
+            restarted += 1
+            operations += 2
+            affected_jobs.add(job_doc.id)
+            if operations >= 400:
+                batch.commit()
+                batch = db_fs.batch()
+                operations = 0
+    if operations:
+        batch.commit()
+
+    for job_id in affected_jobs:
+        db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).set({
+            "status": "queued",
+            "completed_at": None,
+            "updated_at": now,
+        }, merge=True)
+    _sync_queue_control_reference(db_fs).set({
+        "state": _SYNC_QUEUE_RUNNING,
+        "resuming": False,
+        "updated_at": now,
+        "started_at": now,
+        "pause_reason": None,
+    }, merge=True)
+    return restarted
+
+
 def _sync_source_url(source: str, source_id: str) -> str:
     if source == "gdrive":
         return f"gdrive://{source_id}"
@@ -634,6 +805,7 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
     db_fs = _sync_jobs_client()
     job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
     item_collection = job_ref.collection("items")
+    queue_is_paused = not _sync_queue_is_runnable(db_fs)
     added = 0
 
     for item in items:
@@ -656,6 +828,8 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
         item_status = str(item.get("initial_status") or _SYNC_ITEM_PENDING)
         if item_status not in _SYNC_ITEM_STATUSES:
             raise ValueError(f"Unsupported initial sync item status: {item_status}")
+        if queue_is_paused and item_status in {_SYNC_ITEM_PENDING, _SYNC_ITEM_FAILED}:
+            item_status = _SYNC_ITEM_PAUSED
         item_error = str(item.get("error") or "").strip()[:2000] or None
 
         item_data = {
@@ -695,7 +869,7 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
 
     item_statuses = [item_doc.to_dict().get("status") for item_doc in item_collection.stream()]
     has_runnable_items = any(
-        item_status in {_SYNC_ITEM_PENDING, _SYNC_ITEM_PROCESSING}
+        item_status in {_SYNC_ITEM_PENDING, _SYNC_ITEM_PROCESSING, _SYNC_ITEM_PAUSED}
         for item_status in item_statuses
     )
     has_failed_items = _SYNC_ITEM_FAILED in item_statuses
@@ -726,6 +900,13 @@ def _claim_next_sync_item(job_id: str) -> Optional[dict]:
 
         @firestore.transactional
         def claim_item(transaction):
+            queue_snapshot = _sync_queue_control_reference(db_fs).get(transaction=transaction)
+            queue_state = (
+                (queue_snapshot.to_dict() or {}).get("state")
+                if queue_snapshot.exists else None
+            )
+            if queue_state != _SYNC_QUEUE_RUNNING or (queue_snapshot.to_dict() or {}).get("resuming", False):
+                return None
             job_snapshot = job_ref.get(transaction=transaction)
             job = job_snapshot.to_dict() if job_snapshot.exists else None
             if not job or job.get("status") not in {"queued", "running", "discovering"}:
@@ -950,98 +1131,6 @@ def _recover_empty_index_failures() -> int:
     return recovered
 
 
-def _pause_sync_job(job_id: str) -> dict:
-    db_fs = _sync_jobs_client()
-    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    job_doc = job_ref.get()
-    if not job_doc.exists:
-        raise HTTPException(status_code=404, detail="Sync job not found.")
-
-    current_status = (job_doc.to_dict() or {}).get("status")
-    if current_status == "completed":
-        raise HTTPException(status_code=409, detail="Completed jobs cannot be paused.")
-
-    now = _sync_timestamp()
-    job_ref.set({
-        "status": _SYNC_JOB_PAUSED,
-        "paused_at": now,
-        "updated_at": now,
-    }, merge=True)
-    return _sync_job_status(job_id)
-
-
-def _restart_sync_job(job_id: str) -> dict:
-    db_fs = _sync_jobs_client()
-    job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    job_doc = job_ref.get()
-    if not job_doc.exists:
-        raise HTTPException(status_code=404, detail="Sync job not found.")
-
-    job = job_doc.to_dict() or {}
-    if job.get("status") != _SYNC_JOB_PAUSED:
-        raise HTTPException(status_code=409, detail="Pause the sync job before restarting it.")
-
-    processing_items = [
-        item_doc.id
-        for item_doc in job_ref.collection("items").where(
-            "status", "==", _SYNC_ITEM_PROCESSING
-        ).stream()
-    ]
-    if processing_items:
-        raise HTTPException(
-            status_code=409,
-            detail="Wait for the processing item to finish or fail before restarting this job.",
-        )
-
-    now = _sync_timestamp()
-    restarted_items = 0
-    batch = db_fs.batch()
-    batch_operations = 0
-    for item_doc in job_ref.collection("items").where(
-        "status", "==", _SYNC_ITEM_FAILED
-    ).stream():
-        item = item_doc.to_dict() or {}
-        batch.update(item_doc.reference, {
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "next_attempt_at": None,
-            "lease_expires_at": None,
-            "started_at": None,
-            "completed_at": None,
-            "updated_at": now,
-            "error": None,
-            "worker_id": None,
-            "claim_token": None,
-        })
-        batch.set(_sync_source_item_reference(
-            db_fs, item["source"], item["source_id"], item.get("dedupe_key")
-        ), {
-            "status": _SYNC_ITEM_PENDING,
-            "attempts": 0,
-            "updated_at": now,
-            "error": None,
-        }, merge=True)
-        restarted_items += 1
-        batch_operations += 2
-        if batch_operations >= 400:
-            batch.commit()
-            batch = db_fs.batch()
-            batch_operations = 0
-    if batch_operations:
-        batch.commit()
-
-    job_ref.set({
-        "status": "queued",
-        "completed_at": None,
-        "paused_at": None,
-        "restarted_at": now,
-        "restarted_failed_items": restarted_items,
-        "updated_at": now,
-    }, merge=True)
-    _wake_sync_worker()
-    return _sync_job_status(job_id)
-
-
 def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
     db_fs = _sync_jobs_client()
     job_ref = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id)
@@ -1058,13 +1147,15 @@ def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
     if item.get("status") == _SYNC_ITEM_PROCESSING:
         raise HTTPException(
             status_code=409,
-            detail="A processing item cannot be removed. Pause the job and wait for it to stop first.",
+            detail="A processing item cannot be removed. It must finish or fail first.",
         )
     if item.get("status") == _SYNC_ITEM_COMPLETED:
         raise HTTPException(
             status_code=409,
             detail="Completed items are already indexed and cannot be removed from the queue.",
         )
+    if item.get("status") not in {_SYNC_ITEM_PAUSED, _SYNC_ITEM_PENDING, _SYNC_ITEM_FAILED}:
+        raise HTTPException(status_code=409, detail="Only paused, pending, or failed items can be removed.")
 
     batch = db_fs.batch()
     batch.delete(item_ref)
@@ -1072,20 +1163,23 @@ def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
         db_fs, item["source"], item["source_id"], item.get("dedupe_key")
     ))
     batch.commit()
-    if item.get("source") == "files":
+    if item.get("source") in {"files", "paste", "blogs"}:
         _delete_staged_sync_upload(item)
-    _refresh_sync_job_status(job_id)
+    remaining_items = list(job_ref.collection("items").limit(1).stream())
+    job_deleted = not remaining_items
+    if job_deleted:
+        job_ref.delete()
+    else:
+        _refresh_sync_job_status(job_id)
 
-    result = _sync_job_status(job_id)
-    result["removed_item"] = {"id": item_id, "name": item.get("name")}
-    return result
+    return {
+        "removed_item": {"id": item_id, "name": item.get("name")},
+        "job_deleted": job_deleted,
+    }
 
 
 def _refresh_sync_job_status(job_id: str) -> None:
     job_ref = _sync_jobs_client().collection(_SYNC_JOBS_COLLECTION).document(job_id)
-    job = job_ref.get().to_dict() or {}
-    if job.get("status") == _SYNC_JOB_PAUSED:
-        return
     statuses = [
         item_doc.to_dict().get("status")
         for item_doc in job_ref.collection("items").stream()
@@ -1098,7 +1192,11 @@ def _refresh_sync_job_status(job_id: str) -> None:
         }, merge=True)
         return
 
-    if _SYNC_ITEM_PENDING in statuses or _SYNC_ITEM_PROCESSING in statuses:
+    if (
+        _SYNC_ITEM_PENDING in statuses
+        or _SYNC_ITEM_PROCESSING in statuses
+        or _SYNC_ITEM_PAUSED in statuses
+    ):
         job_ref.set({"status": "running", "updated_at": _sync_timestamp()}, merge=True)
         return
 
@@ -1111,14 +1209,14 @@ def _refresh_sync_job_status(job_id: str) -> None:
 
 def _claim_next_sync_work() -> Optional[tuple[str, dict]]:
     db_fs = _sync_jobs_client()
+    if not _sync_queue_is_runnable(db_fs):
+        return None
     for job_doc in db_fs.collection(_SYNC_JOBS_COLLECTION).order_by("created_at").stream():
         job = job_doc.to_dict()
         job_status = job.get("status")
-        if job_status not in {"queued", "running", "discovering", _SYNC_JOB_PAUSED}:
+        if job_status not in {"queued", "running", "discovering"}:
             continue
         _recover_stale_sync_items(job_doc.id)
-        if job_status == _SYNC_JOB_PAUSED:
-            continue
         item = _claim_next_sync_item(job_doc.id)
         if item:
             job_doc.reference.set({"status": "running", "updated_at": _sync_timestamp()}, merge=True)
@@ -1397,6 +1495,10 @@ async def _sync_worker_loop() -> None:
                 await _wait_for_sync_worker_wakeup()
                 continue
 
+            if not await asyncio.to_thread(lambda: _sync_queue_is_runnable(_sync_jobs_client())):
+                await _wait_for_sync_worker_wakeup()
+                continue
+
             recovered = await asyncio.to_thread(_recover_empty_index_failures)
             if recovered:
                 logger.warning("Worker: requeued %d item(s) after empty-index recovery.", recovered)
@@ -1448,6 +1550,8 @@ def _start_sync_worker() -> None:
         return
     if not _index_storage_ready:
         logger.error("Sync worker not started: %s", _index_storage_error)
+        return
+    if not _sync_queue_is_runnable(_sync_jobs_client()):
         return
     if _sync_worker_task is not None and not _sync_worker_task.done():
         return
@@ -1990,14 +2094,12 @@ async def startup_event():
         except Exception as exc:
             logger.error("Startup: RAG warm-up failed — first query will trigger lazy load. Error: %s", exc)
 
+    if os.environ.get("GOOGLE_CLOUD_PROJECT", ""):
         try:
-            recovered = await asyncio.to_thread(_recover_empty_index_failures)
-            if recovered:
-                logger.warning("Startup: requeued %d item(s) after empty-index recovery.", recovered)
+            paused = await asyncio.to_thread(_set_sync_queue_paused, startup=True)
+            logger.info("Startup: paused %d unfinished sync item(s).", paused)
         except Exception as exc:
-            logger.error("Startup: empty-index recovery failed: %s", exc)
-
-        _start_sync_worker()
+            logger.error("Startup: failed to pause the sync queue: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -2677,6 +2779,32 @@ def list_sync_items(
     return _list_sync_items(limit=limit, offset=offset)
 
 
+@app.get("/sync-queue/status")
+def get_sync_queue_status(_: AdminDep):
+    """Return the single shared queue state and activity counts."""
+    return _sync_queue_status()
+
+
+@app.post("/sync-queue/pause")
+def pause_sync_queue(_: AdminDep):
+    """Pause new claims while a current item finishes or fails normally."""
+    paused_items = _set_sync_queue_paused()
+    result = _sync_queue_status()
+    result["paused_items"] = paused_items
+    return result
+
+
+@app.post("/sync-queue/start")
+async def start_sync_queue(_: AdminDep):
+    """Requeue paused work and start the shared worker."""
+    restarted_items = await asyncio.to_thread(_start_sync_queue)
+    _start_sync_worker()
+    _wake_sync_worker()
+    result = await asyncio.to_thread(_sync_queue_status)
+    result["restarted_items"] = restarted_items
+    return result
+
+
 @app.get("/sync-jobs/{job_id}")
 def get_sync_job(
     job_id: str,
@@ -2688,21 +2816,9 @@ def get_sync_job(
     return _sync_job_status(job_id, item_limit, item_offset)
 
 
-@app.post("/sync-jobs/{job_id}/pause")
-def pause_sync_job(job_id: str, _: AdminDep):
-    """Stop new work claims while any active item finishes or fails normally."""
-    return _pause_sync_job(job_id)
-
-
-@app.post("/sync-jobs/{job_id}/restart")
-def restart_sync_job(job_id: str, _: AdminDep):
-    """Resume a paused job and requeue its terminally failed items."""
-    return _restart_sync_job(job_id)
-
-
 @app.delete("/sync-jobs/{job_id}/items/{item_id}")
 def remove_sync_job_item(job_id: str, item_id: str, _: AdminDep):
-    """Remove a pending or failed item from a sync job without indexing it."""
+    """Remove a paused, pending, or failed item without indexing it."""
     return _remove_sync_job_item(job_id, item_id)
 
 
