@@ -319,8 +319,9 @@
   .sync-job-count { padding: 2px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 11px; white-space: nowrap; }
   .sync-job-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--border); }
   .sync-job-items { border-top: 1px solid var(--border); max-height: 360px; overflow-y: auto; }
-  .sync-job-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 8px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .sync-job-item { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; gap: 8px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
   .sync-job-item:last-child { border-bottom: none; }
+  .sync-job-item-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
   .sync-job-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sync-status { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
   .sync-status.pending { color: var(--blue); }
@@ -330,7 +331,9 @@
   .sync-job-error { grid-column: 1 / -1; color: var(--red); font-family: var(--mono); font-size: 10px; white-space: pre-wrap; word-break: break-word; }
   @media (max-width: 600px) {
     .sync-job-counts { margin-left: 0; width: 100%; }
-    .sync-job-item { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .sync-job-item, .sync-job-item-head { grid-template-columns: minmax(0, 1fr) auto auto; }
+    .sync-job-item-head span:nth-child(4), .sync-job-item-head span:nth-child(5) { display: none; }
+    .sync-job-item > :nth-child(4) { display: none; }
     .sync-job-item .btn { grid-column: 1 / -1; justify-self: start; }
   }
 
@@ -461,18 +464,18 @@
   <div class="tabs">
     <button class="tab" onclick="switchTab(event, 'prompt')">Prompt</button>
     <button class="tab" onclick="switchTab(event, 'chats')">Chats</button>
-    <button class="tab" onclick="switchTab(event, 'jobs')">Sync Jobs</button>
     <button class="tab" onclick="switchTab(event, 'index')">Knowledge Base</button>
-    <button class="tab" onclick="switchTab(event, 'documents')">Paste Documents</button>
+    <button class="tab" onclick="switchTab(event, 'documents')">Paste Text</button>
     <button class="tab" onclick="switchTab(event, 'folder')">File / Zip</button>
     <button class="tab" onclick="switchTab(event, 'videos')">Videos</button>
+    <button class="tab" onclick="switchTab(event, 'jobs')">Scheduled Jobs</button>
     <button class="tab" onclick="switchTab(event, 'cleanup')">Cleanup</button>
   </div>
 
   <!-- ── PASTE DOCUMENTS (with inline cleaner) ── -->
   <div id="panel-documents" class="panel">
     <div class="card">
-      <div class="card-title">Document details</div>
+      <div class="card-title">Text details</div>
       <div class="row">
         <div>
           <label>Title</label>
@@ -517,7 +520,7 @@
 
       <div class="btn-group" style="margin-top:10px">
         <button class="btn btn-primary" onclick="ingestDocuments()">
-          <span id="doc-spinner"></span> Ingest document
+          <span id="doc-spinner"></span> Queue text
         </button>
         <button class="btn" onclick="clearDocForm()">Clear</button>
       </div>
@@ -556,7 +559,7 @@
       </div>
       <div class="btn-group">
         <button class="btn btn-primary" onclick="ingestFolder()">
-          <span id="folder-spinner"></span> Ingest folder
+          <span id="folder-spinner"></span> Queue files
         </button>
       </div>
       <div id="folder-toast" class="toast"></div>
@@ -582,7 +585,7 @@
       <div class="btn-group" style="margin-top:8px">
         <button class="btn btn-sm" onclick="addVideoRow()">+ Add URL</button>
         <button class="btn btn-primary" onclick="ingestVideos()">
-          <span id="video-spinner"></span> Ingest videos
+          <span id="video-spinner"></span> Queue videos
         </button>
       </div>
       <div id="video-toast" class="toast"></div>
@@ -623,10 +626,10 @@
   <div id="panel-jobs" class="panel">
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
-        <div class="card-title" style="margin:0">Background Sync Jobs</div>
+        <div class="card-title" style="margin:0">Scheduled Queue &amp; Activity</div>
         <button class="btn btn-sm" onclick="loadSyncJobs()">↺ Refresh</button>
       </div>
-      <p class="hint">Refreshes every 10 seconds while this tab is open. Remove only skips queued or failed items; completed files remain indexed.</p>
+      <p class="hint">Newest items appear first. This is one shared queue and activity log; source identifies where each item came from.</p>
       <div id="sync-jobs-status" class="chats-status" style="display:none"></div>
       <div id="sync-jobs-list"></div>
     </div>
@@ -1038,7 +1041,7 @@ async function ingestDocuments() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
-    showToast('doc-toast', `✓ Ingested — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+    showToast('doc-toast', `✓ Queued ${data.queued} text item(s). See Scheduled Jobs.`, 'ok');
   } catch(e) {
     showToast('doc-toast', '✕ ' + e.message, 'err');
   }
@@ -1063,7 +1066,7 @@ async function ingestFolder() {
   formData.append('recursive', document.getElementById('folder-recursive').checked);
 
   spin('folder-spinner', true);
-  showToast('folder-toast', 'Uploading and ingesting… this may take a while.', 'info');
+  showToast('folder-toast', 'Uploading and queueing files…', 'info');
   try {
     const res = await authFetch(API + '/ingest/folder', {
       method: 'POST',
@@ -1071,7 +1074,7 @@ async function ingestFolder() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
-    showToast('folder-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+    showToast('folder-toast', `✓ Queued ${data.queued} file(s). See Scheduled Jobs.`, 'ok');
   } catch(e) {
     showToast('folder-toast', '✕ ' + e.message, 'err');
   }
@@ -1094,7 +1097,7 @@ async function ingestVideos() {
     .map(i => i.value.trim()).filter(Boolean);
   if (!urls.length) return showToast('video-toast', 'Add at least one URL.', 'err');
   spin('video-spinner', true);
-  showToast('video-toast', 'Ingesting videos… Gemini is transcribing each one.', 'info');
+  showToast('video-toast', 'Queueing videos…', 'info');
   try {
     const res = await authFetch(API + '/ingest/videos', {
       method: 'POST',
@@ -1103,7 +1106,7 @@ async function ingestVideos() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
-    showToast('video-toast', `✓ Done — ${data.chunks_stored} chunk(s) stored.`, 'ok');
+    showToast('video-toast', `✓ Queued ${data.queued} video item(s). See Scheduled Jobs.`, 'ok');
   } catch(e) {
     showToast('video-toast', '✕ ' + e.message, 'err');
   }
@@ -1311,19 +1314,14 @@ async function loadSyncJobs() {
   const statusEl = document.getElementById('sync-jobs-status');
 
   try {
-    const response = await authFetch(`${API}/sync-jobs`);
+    const response = await authFetch(`${API}/sync-items?limit=500`);
     if (!response.ok) throw new Error(await syncJobError(response));
     const data = await response.json();
-    const jobs = data.jobs || [];
-    const details = await Promise.all(jobs.map(async job => {
-      const detailResponse = await authFetch(`${API}/sync-jobs/${encodeURIComponent(job.id)}?item_limit=500`);
-      if (!detailResponse.ok) throw new Error(await syncJobError(detailResponse));
-      return detailResponse.json();
-    }));
+    const items = data.items || [];
 
-    listEl.innerHTML = details.length
-      ? details.map(renderSyncJob).join('')
-      : '<div style="padding:20px;text-align:center;color:var(--muted)">No sync jobs yet.</div>';
+    listEl.innerHTML = items.length
+      ? renderSyncItemList(items)
+      : '<div style="padding:20px;text-align:center;color:var(--muted)">No scheduled items yet.</div>';
     statusEl.style.display = 'none';
   } catch (error) {
     statusEl.textContent = `Failed to load sync jobs: ${error.message}`;
@@ -1334,39 +1332,26 @@ async function loadSyncJobs() {
   }
 }
 
-function renderSyncJob(job) {
-  const counts = job.counts || {};
-  const countHtml = ['pending', 'processing', 'completed', 'failed']
-    .map(status => `<span class="sync-job-count">${status}: ${counts[status] || 0}</span>`)
-    .join('');
-  const itemsHtml = (job.items || []).map(item => {
+function renderSyncItemList(items) {
+  const itemsHtml = items.map(item => {
     const canRemove = item.status === 'pending' || item.status === 'failed';
     return `
       <div class="sync-job-item">
         <span class="sync-job-item-name">${esc(item.name || item.source_id)}</span>
+        <span>${esc(item.source || 'unknown')}</span>
         <span class="sync-status ${esc(item.status)}">${esc(item.status)}</span>
         <span>${item.attempts || 0} attempt${item.attempts === 1 ? '' : 's'}</span>
-        ${canRemove ? `<button class="btn btn-sm" onclick="removeSyncJobItem('${job.id}', '${item.id}')">Remove</button>` : ''}
+        ${canRemove ? `<button class="btn btn-sm" onclick="removeSyncJobItem('${item.job_id}', '${item.id}')">Remove</button>` : ''}
         ${item.error ? `<div class="sync-job-error">${esc(item.error)}</div>` : ''}
       </div>`;
   }).join('');
-  const canRestart = job.status === 'paused';
-  const canPause = job.status !== 'completed';
 
   return `
     <section class="sync-job-card">
-      <div class="sync-job-header">
-        <div>
-          <div class="sync-job-title">${esc(job.source || 'sync')} · ${esc(job.status || 'unknown')}</div>
-          <div class="sync-job-meta">Started ${esc(job.created_at || 'unknown')}</div>
-        </div>
-        <div class="sync-job-counts">${countHtml}</div>
+      <div class="sync-job-item-head">
+        <span>Item</span><span>Source</span><span>Status</span><span>Attempts</span><span></span>
       </div>
-      <div class="sync-job-actions">
-        ${canPause ? `<button class="btn btn-sm" onclick="runSyncJobAction('${job.id}', 'pause')">Pause & reset unfinished</button>` : ''}
-        ${canRestart ? `<button class="btn btn-sm btn-primary" onclick="runSyncJobAction('${job.id}', 'restart')">Restart</button>` : ''}
-      </div>
-      <div class="sync-job-items">${itemsHtml || '<div style="padding:12px;color:var(--muted);font-size:12px">No queued items.</div>'}</div>
+      <div class="sync-job-items">${itemsHtml}</div>
     </section>`;
 }
 

@@ -49,6 +49,7 @@ import secrets
 import queue as _sync_queue
 import re
 import socket
+import stat
 import threading
 import uuid
 import xml.etree.ElementTree as ET
@@ -584,7 +585,7 @@ _GDRIVE_SERVICE_CACHE_TTL = 3600  # 1 hour
 _SYNC_JOBS_COLLECTION = "sync_jobs"
 _SYNC_SOURCE_ITEMS_COLLECTION = "sync_source_items"
 _YOUTUBE_SUBSCRIPTIONS_COLLECTION = "youtube_subscriptions"
-_SYNC_JOB_SOURCES = {"gdrive", "blogs", "youtube"}
+_SYNC_JOB_SOURCES = {"gdrive", "blogs", "youtube", "paste", "files", "videos"}
 _SYNC_ITEM_PENDING = "pending"
 _SYNC_ITEM_PROCESSING = "processing"
 _SYNC_ITEM_COMPLETED = "completed"
@@ -721,6 +722,12 @@ def _sync_source_url(source: str, source_id: str) -> str:
         return f"cms://blog/{source_id}"
     if source == "youtube":
         return f"https://www.youtube.com/watch?v={source_id}"
+    if source == "paste":
+        return f"paste://{source_id}"
+    if source == "files":
+        return f"upload://{source_id}"
+    if source == "videos":
+        return f"video://{source_id}"
     raise ValueError(f"Unsupported sync source: {source}")
 
 
@@ -792,11 +799,15 @@ def _add_sync_job_items(job_id: str, source: str, items: list[dict]) -> int:
             continue
 
         now = _sync_timestamp()
+        source_url = str(item.get("source_url") or _sync_source_url(source, source_id)).strip()
+        if not source_url:
+            raise ValueError("Each sync job item requires a source_url.")
+
         item_data = {
             "source": source,
             "source_id": source_id,
             "dedupe_key": dedupe_key,
-            "source_url": _sync_source_url(source, source_id),
+            "source_url": source_url,
             "name": item.get("name", source_id),
             "created_time": item.get("created_time"),
             "status": _SYNC_ITEM_PENDING,
@@ -1172,6 +1183,8 @@ def _remove_sync_job_item(job_id: str, item_id: str) -> dict:
         db_fs, item["source"], item["source_id"], item.get("dedupe_key")
     ))
     batch.commit()
+    if item.get("source") == "files":
+        _delete_staged_sync_upload(item)
     _refresh_sync_job_status(job_id)
 
     result = _sync_job_status(job_id)
@@ -1343,6 +1356,115 @@ def _process_youtube_sync_item(item: dict) -> int:
     return _run_index_mutation(ingest)
 
 
+def _process_paste_sync_item(item: dict) -> int:
+    metadata = item.get("metadata", {})
+    content = (metadata.get("content") or "").strip()
+    if not content:
+        raise RuntimeError("Pasted text item has no indexable content.")
+
+    def ingest() -> int:
+        rag = _get_rag()
+        chunks_stored = rag.ingest_raw_documents([{
+            "title": metadata.get("title") or item.get("name") or "Untitled",
+            "content": content,
+            "section": metadata.get("section") or "general",
+            "url": metadata.get("url") or item["source_url"],
+            "doc_type": metadata.get("doc_type") or "text",
+        }])
+        if chunks_stored <= 0:
+            raise RuntimeError("No indexable chunks were produced from the pasted text.")
+        _save_and_sync(rag)
+        return chunks_stored
+
+    return _run_index_mutation(ingest)
+
+
+def _sync_upload_bucket():
+    bucket_name = _current_config.get("gcs_bucket", "")
+    if not bucket_name:
+        raise RuntimeError("Queued file uploads require GCS_BUCKET to be configured.")
+    return _gcs_client().bucket(bucket_name)
+
+
+def _stage_sync_upload(name: str, content: bytes) -> dict:
+    safe_name = Path(name).name
+    if not safe_name:
+        raise ValueError("Uploaded file has no usable filename.")
+
+    source_id = hashlib.sha256(name.encode("utf-8") + b"\0" + content).hexdigest()
+    object_name = f"sync_uploads/{source_id}/{safe_name}"
+    blob = _sync_upload_bucket().blob(object_name)
+    staged_upload = not blob.exists()
+    if staged_upload:
+        blob.upload_from_string(content)
+    return {
+        "source_id": source_id,
+        "source_url": _sync_source_url("files", source_id),
+        "name": safe_name,
+        "metadata": {
+            "object_name": object_name,
+            "original_name": name,
+        },
+        "staged_upload": staged_upload,
+    }
+
+
+def _delete_staged_sync_upload(item: dict) -> None:
+    object_name = (item.get("metadata") or {}).get("object_name")
+    if not object_name:
+        return
+    try:
+        _sync_upload_bucket().blob(object_name).delete()
+    except Exception:
+        logger.warning("Could not delete staged upload %s after indexing", object_name, exc_info=True)
+
+
+def _process_file_sync_item(item: dict) -> int:
+    metadata = item.get("metadata", {})
+    object_name = str(metadata.get("object_name") or "").strip()
+    file_name = Path(item.get("name") or "").name
+    if not object_name or not file_name:
+        raise RuntimeError("Queued file item is missing its staged upload details.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = Path(tmpdir) / file_name
+        _sync_upload_bucket().blob(object_name).download_to_filename(str(local_path))
+
+        def ingest() -> int:
+            rag = _get_rag()
+            chunks_stored = rag.ingest_file(
+                str(local_path),
+                section=metadata.get("section") or "general",
+                source_url=item["source_url"],
+            )
+            if chunks_stored <= 0:
+                raise RuntimeError("No indexable content was extracted from the uploaded file.")
+            _save_and_sync(rag)
+            return chunks_stored
+
+        chunks_stored = _run_index_mutation(ingest)
+
+    _delete_staged_sync_upload(item)
+    return chunks_stored
+
+
+def _process_video_sync_item(item: dict) -> int:
+    metadata = item.get("metadata", {})
+
+    def ingest() -> int:
+        rag = _get_rag()
+        chunks_stored = rag.ingest_videos(
+            [item["source_url"]],
+            section=metadata.get("section") or "video",
+        )
+        if chunks_stored <= 0:
+            raise RuntimeError("No indexable content was extracted from the submitted video URL.")
+        _save_and_sync(rag)
+        return chunks_stored
+
+    return _run_index_mutation(ingest)
+
+
 def _process_sync_item(item: dict) -> int:
     if item.get("source") == "gdrive":
         return _process_gdrive_sync_item(item)
@@ -1350,6 +1472,12 @@ def _process_sync_item(item: dict) -> int:
         return _process_blog_sync_item(item)
     if item.get("source") == "youtube":
         return _process_youtube_sync_item(item)
+    if item.get("source") == "paste":
+        return _process_paste_sync_item(item)
+    if item.get("source") == "files":
+        return _process_file_sync_item(item)
+    if item.get("source") == "videos":
+        return _process_video_sync_item(item)
     raise RuntimeError(f"No worker handler is registered for sync source {item.get('source')!r}.")
 
 
@@ -1447,6 +1575,8 @@ async def _stop_sync_worker() -> None:
 
 
 def _sync_job_status(job_id: str, item_limit: int = 100, item_offset: int = 0) -> dict:
+    from google.cloud.firestore import Query as FirestoreQuery
+
     db_fs = _sync_jobs_client()
     job_doc = db_fs.collection(_SYNC_JOBS_COLLECTION).document(job_id).get()
     if not job_doc.exists:
@@ -1455,7 +1585,9 @@ def _sync_job_status(job_id: str, item_limit: int = 100, item_offset: int = 0) -
     counts = {item_status: 0 for item_status in _SYNC_ITEM_STATUSES}
     items = []
     for item_index, item_doc in enumerate(
-        job_doc.reference.collection("items").order_by("created_at").stream()
+        job_doc.reference.collection("items").order_by(
+            "created_at", direction=FirestoreQuery.DESCENDING
+        ).stream()
     ):
         item = item_doc.to_dict()
         item["id"] = item_doc.id
@@ -1489,6 +1621,21 @@ def _list_sync_jobs(limit: int = 20) -> list[dict]:
         job["id"] = job_doc.id
         jobs.append(job)
     return jobs
+
+
+def _list_sync_items(limit: int = 100) -> list[dict]:
+    from google.cloud.firestore import Query as FirestoreQuery
+
+    db_fs = _sync_jobs_client()
+    items = []
+    for item_doc in db_fs.collection_group("items").order_by(
+        "created_at", direction=FirestoreQuery.DESCENDING
+    ).limit(limit).stream():
+        item = item_doc.to_dict()
+        item["id"] = item_doc.id
+        item["job_id"] = item_doc.reference.parent.parent.id
+        items.append(item)
+    return items
 
 
 def _load_model_from_firestore() -> Optional[str]:
@@ -2641,6 +2788,12 @@ def list_sync_jobs(_: AdminDep, limit: int = Query(20, ge=1, le=100)):
     return {"jobs": _list_sync_jobs(limit)}
 
 
+@app.get("/sync-items")
+def list_sync_items(_: AdminDep, limit: int = Query(100, ge=1, le=500)):
+    """Return the newest queue and processing-log items across every source."""
+    return {"items": _list_sync_items(limit)}
+
+
 @app.get("/sync-jobs/{job_id}")
 def get_sync_job(
     job_id: str,
@@ -2675,7 +2828,6 @@ def remove_sync_job_item(job_id: str, item_id: str, _: AdminDep):
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest/folder")
-@_serialized_index_mutation
 def ingest_folder(
     _: AdminDep,
     section: str = Form("general"),
@@ -2691,93 +2843,132 @@ def ingest_folder(
     Zip files: any zip containing any mix of the above.
     """
     from orchestrator import _ALL_SUPPORTED
-    rag = _get_rag()
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            file_bytes = file.file.read()
-            extract_dir = os.path.join(tmpdir, "extracted")
-            os.makedirs(extract_dir, exist_ok=True)
+        file_bytes = file.file.read()
+        filename = getattr(file, "filename", "uploaded_file")
+        suffix = Path(filename).suffix.lower()
+        items = []
 
-            filename = getattr(file, "filename", "uploaded_file")
-            suffix = Path(filename).suffix.lower()
-
-            if suffix in _ALL_SUPPORTED:
-                # Single supported file — write directly into the extract dir
-                dest = os.path.join(extract_dir, filename)
-                with open(dest, "wb") as f:
-                    f.write(file_bytes)
-            elif suffix == ".zip" or filename.lower().endswith(".zip"):
-                zip_path = os.path.join(tmpdir, "uploaded.zip")
-                with open(zip_path, "wb") as f:
-                    f.write(file_bytes)
-                try:
-                    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                        zip_ref.extractall(extract_dir)
-                except zipfile.BadZipFile:
-                    raise HTTPException(status_code=400, detail="Invalid zip file.")
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type '{suffix}'. Upload a .zip or a supported document."
-                )
-
-            chunks = rag.ingest_folder(
-                folder_path=extract_dir,
-                section=section,
-                recursive=recursive,
+        if suffix in _ALL_SUPPORTED:
+            items.append(_stage_sync_upload(filename, file_bytes))
+        elif suffix == ".zip" or filename.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zip_ref:
+                    for entry in zip_ref.infolist():
+                        if entry.is_dir():
+                            continue
+                        if stat.S_ISLNK(entry.external_attr >> 16):
+                            continue
+                        entry_path = Path(entry.filename)
+                        if entry_path.suffix.lower() not in _ALL_SUPPORTED:
+                            continue
+                        if not recursive and entry_path.parent != Path("."):
+                            continue
+                        items.append(_stage_sync_upload(
+                            entry.filename,
+                            zip_ref.read(entry),
+                        ))
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Invalid zip file.")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{suffix}'. Upload a .zip or a supported document."
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    _save_and_sync(rag)
+    if not items:
+        raise HTTPException(status_code=400, detail="No supported files were found in the upload.")
+
+    for item in items:
+        item["metadata"]["section"] = section
+        item["metadata"]["recursive"] = recursive
+
+    job_id = _create_sync_job("files", metadata={
+        "submission": "file_upload",
+        "upload_name": filename,
+        "is_zip": suffix == ".zip",
+    })
+    queued = _add_sync_job_items(job_id, "files", items)
+    for item in items:
+        if not item.get("staged_upload"):
+            continue
+        source_item = _sync_source_item_reference(
+            _sync_jobs_client(), "files", item["source_id"]
+        ).get().to_dict() or {}
+        if source_item.get("job_id") != job_id:
+            _delete_staged_sync_upload({"metadata": item["metadata"]})
+    _wake_sync_worker()
     return {
-        "action":        "ingest_folder",
-        "folder_path":   file.filename,
-        "section":       section,
-        "chunks_stored": chunks,
-        "stats":         rag.stats(),
+        "action": "queue_files",
+        "job_id": job_id,
+        "files_received": len(items),
+        "queued": queued,
     }
 
 
 @app.post("/ingest/documents")
-@_serialized_index_mutation
 def ingest_documents(body: RawDocumentsRequest, _: AdminDep):
-    """
-    Inject pre-written text documents directly into the index.
+    """Queue pasted text for durable background ingestion."""
+    items = []
+    for document in body.documents:
+        data = document.model_dump()
+        content = data["content"].strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="Pasted text content cannot be empty.")
+        source_id = hashlib.sha256(
+            json.dumps({
+                "title": data["title"],
+                "section": data["section"],
+                "url": data["url"],
+                "content": content,
+            }, sort_keys=True).encode()
+        ).hexdigest()
+        items.append({
+            "source_id": source_id,
+            "name": data["title"] or "Untitled",
+            "metadata": {**data, "content": content},
+        })
 
-    Each document goes through the normal chunker pipeline.
-    Useful for adding custom bios, CVs, notes, or any text
-    that doesn't have a URL to scrape.
-    """
-    rag = _get_rag()
-    docs = [d.model_dump() for d in body.documents]
-    chunks = rag.ingest_raw_documents(docs)
-    _save_and_sync(rag)
+    job_id = _create_sync_job("paste", metadata={"submission": "paste_text"})
+    queued = _add_sync_job_items(job_id, "paste", items)
+    _wake_sync_worker()
     return {
-        "action":        "ingest_documents",
-        "docs_received": len(docs),
-        "chunks_stored": chunks,
-        "stats":         rag.stats(),
+        "action": "queue_paste_text",
+        "job_id": job_id,
+        "docs_received": len(items),
+        "queued": queued,
     }
 
 
 @app.post("/ingest/videos")
-@_serialized_index_mutation
 def ingest_videos(body: VideosIngestRequest, _: AdminDep):
-    """
-    Summarise a list of YouTube video URLs or playlist URLs via Gemini.
+    """Queue submitted YouTube video or playlist URLs for background ingestion."""
+    items = []
+    for url in body.urls:
+        submitted_url = url.strip()
+        if not submitted_url:
+            continue
+        source_id = hashlib.sha256(submitted_url.encode()).hexdigest()
+        items.append({
+            "source_id": source_id,
+            "source_url": submitted_url,
+            "name": submitted_url,
+            "metadata": {"section": body.section},
+        })
 
-    Playlist URLs (youtube.com/playlist?list=…) are automatically expanded
-    to individual videos.  Results are cached so replaying is free.
-    """
-    rag = _get_rag()
-    chunks = rag.ingest_videos(body.urls, section=body.section)
-    _save_and_sync(rag)
+    if not items:
+        raise HTTPException(status_code=400, detail="At least one video URL is required.")
+
+    job_id = _create_sync_job("videos", metadata={"submission": "admin_videos"})
+    queued = _add_sync_job_items(job_id, "videos", items)
+    _wake_sync_worker()
     return {
-        "action":        "ingest_videos",
-        "urls_received": len(body.urls),
-        "chunks_stored": chunks,
-        "stats":         rag.stats(),
+        "action": "queue_videos",
+        "job_id": job_id,
+        "urls_received": len(items),
+        "queued": queued,
     }
 
 
