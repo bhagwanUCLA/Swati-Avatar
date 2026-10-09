@@ -322,6 +322,9 @@
   .sync-job-item:last-child { border-bottom: none; }
   .sync-job-item-head { display: grid; grid-template-columns: minmax(0, 1fr) 72px 82px 90px 96px; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
   .sync-job-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sync-job-remove { width: 96px; justify-content: center; color: var(--red); border-color: var(--red); }
+  .sync-job-remove:hover { background: var(--red-bg); border-color: var(--red); }
+  .sync-jobs-loading { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 140px; color: var(--muted); font-size: 13px; }
   .sync-status { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
   .sync-status.pending { color: var(--blue); }
   .sync-status.paused { color: var(--muted); }
@@ -1374,6 +1377,10 @@ async function loadSyncJobs(reset = true) {
     ? Math.min(500, Math.max(SYNC_ITEMS_PAGE_SIZE, syncItems.length))
     : SYNC_ITEMS_PAGE_SIZE;
 
+  if (reset && syncItems.length === 0) {
+    listEl.innerHTML = '<div class="sync-jobs-loading"><span class="spinner"></span> Loading scheduled items…</div>';
+  }
+
   try {
     const [itemsResponse, queueResponse] = await Promise.all([
       authFetch(`${API}/sync-items?limit=${limit}&offset=${offset}`),
@@ -1411,7 +1418,7 @@ function renderSyncItemList(items) {
         <span>${esc(item.source || 'unknown')}</span>
         <span class="sync-status ${esc(item.status)}">${esc(item.status)}</span>
         <span>${item.attempts || 0} attempt${item.attempts === 1 ? '' : 's'}</span>
-        ${canRemove ? `<button class="btn btn-sm" onclick="removeSyncJobItem('${item.job_id}', '${item.id}')">Remove</button>` : ''}
+        ${canRemove ? `<button class="btn btn-sm sync-job-remove" onclick="removeSyncJobItem('${item.job_id}', '${item.id}')">Remove</button>` : ''}
         ${item.error ? `<div class="sync-job-error">${esc(item.error)}</div>` : ''}
       </div>`;
   }).join('');

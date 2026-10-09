@@ -3311,6 +3311,34 @@ def add_youtube_test_channel(body: YouTubeTestChannelRequest, request: Request, 
     return {"test_channel": result, "queues_existing_videos": False}
 
 
+@app.get("/youtube/test-channels/{channel_id}")
+def get_youtube_test_channel(channel_id: str, _: AdminDep):
+    """Return the stored PubSub request and verification state for one test channel."""
+    normalized_channel_id = channel_id.strip()
+    if not re.fullmatch(r"UC[\w-]{22}", normalized_channel_id):
+        raise HTTPException(status_code=400, detail="channel_id must be a valid YouTube channel ID.")
+    try:
+        db_fs = _sync_jobs_client()
+        test_doc = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(
+            normalized_channel_id
+        ).get()
+        if not test_doc.exists:
+            raise HTTPException(status_code=404, detail="Temporary test channel not found.")
+        subscription_doc = db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(
+            normalized_channel_id
+        ).get()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unable to inspect temporary YouTube test channel %s", normalized_channel_id)
+        raise HTTPException(status_code=503, detail="Unable to inspect temporary YouTube test channel.") from exc
+
+    return {
+        "test_channel": test_doc.to_dict() or {},
+        "subscription": subscription_doc.to_dict() if subscription_doc.exists else None,
+    }
+
+
 @app.delete("/youtube/test-channels/{channel_id}")
 def delete_youtube_test_channel(channel_id: str, request: Request, _: AdminDep):
     """Remove a temporary channel and request that the Hub unsubscribe it."""
