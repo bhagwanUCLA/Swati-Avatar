@@ -26,6 +26,7 @@ videos/
 outputs/
 links.txt
 *.md
+!ADMIN_FLOW_AND_FEATURES.md
 # Misc
 *.log
 .DS_Store
