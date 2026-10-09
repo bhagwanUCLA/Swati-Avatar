@@ -436,6 +436,7 @@ _GDRIVE_SERVICE_CACHE_TTL = 3600  # 1 hour
 _SYNC_JOBS_COLLECTION = "sync_jobs"
 _SYNC_SOURCE_ITEMS_COLLECTION = "sync_source_items"
 _YOUTUBE_SUBSCRIPTIONS_COLLECTION = "youtube_subscriptions"
+_YOUTUBE_TEST_CHANNELS_COLLECTION = "youtube_test_channels"
 _SYNC_QUEUE_CONTROL_COLLECTION = "system_config"
 _SYNC_QUEUE_CONTROL_DOCUMENT = "sync_queue"
 _SYNC_JOB_SOURCES = {"gdrive", "blogs", "youtube", "paste", "files", "videos"}
@@ -1929,6 +1930,10 @@ class VideosIngestRequest(BaseModel):
     section: str = "video"
 
 
+class YouTubeTestChannelRequest(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=100)
+
+
 class CleanupRequest(BaseModel):
     repeated_word_enabled:    bool        = False
     repeated_word_min_length: int         = 4
@@ -3059,17 +3064,31 @@ def clear_index(_: AdminDep):
 # YouTube PubSubHubbub  (automatic new-video ingestion)
 # ---------------------------------------------------------------------------
 
-def _youtube_pubsub_config() -> tuple[set[str], str]:
-    channel_ids = {
+def _configured_youtube_channel_ids() -> set[str]:
+    return {
         channel_id.strip()
         for channel_id in os.environ.get("WATCHED_CHANNEL_IDS", "").split(",")
         if channel_id.strip()
     }
+
+
+def _youtube_test_channel_ids() -> set[str]:
+    """Return temporary test-channel IDs stored in Firestore."""
+    return {
+        channel_doc.id
+        for channel_doc in _sync_jobs_client().collection(
+            _YOUTUBE_TEST_CHANNELS_COLLECTION
+        ).stream()
+    }
+
+
+def _youtube_pubsub_config() -> tuple[set[str], str]:
     secret = os.environ.get("PUBSUB_SECRET", "").strip()
-    if not channel_ids:
-        raise HTTPException(status_code=503, detail="WATCHED_CHANNEL_IDS is not configured.")
     if not secret:
         raise HTTPException(status_code=503, detail="PUBSUB_SECRET is not configured.")
+    channel_ids = _configured_youtube_channel_ids() | _youtube_test_channel_ids()
+    if not channel_ids:
+        raise HTTPException(status_code=503, detail="No watched YouTube channels are configured.")
     return channel_ids, secret
 
 
@@ -3097,6 +3116,49 @@ def _youtube_notification_channel_id(root: ET.Element) -> Optional[str]:
             return channel_id
     return None
 
+
+def _youtube_callback_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/") + "/youtube/notify"
+
+
+def _request_youtube_subscription(
+    channel_id: str,
+    secret: str,
+    callback: str,
+    mode: str,
+) -> dict:
+    topic = f"https://www.youtube.com/xml/feeds/videos.xml?channel_id={channel_id}"
+    try:
+        response = _req.post(
+            "https://pubsubhubbub.appspot.com/subscribe",
+            data={
+                "hub.mode": mode,
+                "hub.topic": topic,
+                "hub.callback": callback,
+                "hub.lease_seconds": 2592000,
+                "hub.secret": secret,
+            },
+            timeout=15,
+        )
+        expected_status = 202
+        result_status = (
+            "requested" if mode == "subscribe" else "unsubscribe_requested"
+        ) if response.status_code == expected_status else "rejected"
+        return {
+            "channel_id": channel_id,
+            "topic": topic,
+            "http_status": response.status_code,
+            "status": result_status,
+        }
+    except Exception as exc:
+        logger.error("PubSubHubbub %s request failed for %s: %s", mode, channel_id, exc)
+        return {
+            "channel_id": channel_id,
+            "topic": topic,
+            "status": "request_failed",
+            "error": str(exc),
+        }
+
 @app.get("/youtube/notify")
 async def youtube_verify(
     hub_challenge: str = Query(..., alias="hub.challenge"),
@@ -3108,13 +3170,21 @@ async def youtube_verify(
     if not channel_id or channel_id not in watched_channels:
         raise HTTPException(status_code=403, detail="Unrecognized YouTube subscription topic.")
     try:
-        _sync_jobs_client().collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
+        db_fs = _sync_jobs_client()
+        db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
             "channel_id": channel_id,
             "topic": hub_topic,
             "status": "verified",
             "verified_at": _sync_timestamp(),
             "updated_at": _sync_timestamp(),
         }, merge=True)
+        test_channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
+        if test_channel_ref.get().exists:
+            test_channel_ref.set({
+                "status": "verified",
+                "verified_at": _sync_timestamp(),
+                "updated_at": _sync_timestamp(),
+            }, merge=True)
     except Exception as exc:
         logger.exception("Unable to record YouTube subscription verification for %s", channel_id)
         raise HTTPException(status_code=503, detail="Unable to record YouTube subscription verification.") from exc
@@ -3179,6 +3249,105 @@ async def youtube_notify(request: Request):
     _wake_sync_worker()
 
     return Response(status_code=204)
+
+
+@app.post("/youtube/test-channels")
+def add_youtube_test_channel(body: YouTubeTestChannelRequest, request: Request, _: AdminDep):
+    """Temporarily subscribe one additional channel without queueing old videos."""
+    channel_id = body.channel_id.strip()
+    if not re.fullmatch(r"UC[\w-]{22}", channel_id):
+        raise HTTPException(status_code=400, detail="channel_id must be a valid YouTube channel ID.")
+    if channel_id in _configured_youtube_channel_ids():
+        raise HTTPException(status_code=409, detail="This channel is already configured permanently.")
+
+    secret = os.environ.get("PUBSUB_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PUBSUB_SECRET is not configured.")
+
+    try:
+        db_fs = _sync_jobs_client()
+        channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(channel_id)
+        existing = channel_ref.get()
+        if existing.exists:
+            raise HTTPException(status_code=409, detail="This temporary test channel is already registered.")
+
+        callback = _youtube_callback_url(request)
+        now = _sync_timestamp()
+        channel_ref.set({
+            "channel_id": channel_id,
+            "callback": callback,
+            "status": "subscribing",
+            "created_at": now,
+            "updated_at": now,
+        })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unable to store temporary YouTube test channel %s", channel_id)
+        raise HTTPException(status_code=503, detail="Unable to store temporary YouTube test channel.") from exc
+
+    result = _request_youtube_subscription(channel_id, secret, callback, "subscribe")
+    try:
+        channel_ref.set({
+            "status": result["status"],
+            "http_status": result.get("http_status"),
+            "error": result.get("error"),
+            "updated_at": _sync_timestamp(),
+        }, merge=True)
+        db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(channel_id).set({
+            "channel_id": channel_id,
+            "topic": result["topic"],
+            "callback": callback,
+            "temporary": True,
+            "status": result["status"],
+            "http_status": result.get("http_status"),
+            "error": result.get("error"),
+            "requested_at": _sync_timestamp(),
+            "updated_at": _sync_timestamp(),
+        }, merge=True)
+    except Exception as exc:
+        logger.exception("Unable to update temporary YouTube test channel %s", channel_id)
+        raise HTTPException(status_code=503, detail="YouTube subscription request was sent but could not be recorded.") from exc
+    return {"test_channel": result, "queues_existing_videos": False}
+
+
+@app.delete("/youtube/test-channels/{channel_id}")
+def delete_youtube_test_channel(channel_id: str, request: Request, _: AdminDep):
+    """Remove a temporary channel and request that the Hub unsubscribe it."""
+    normalized_channel_id = channel_id.strip()
+    if not re.fullmatch(r"UC[\w-]{22}", normalized_channel_id):
+        raise HTTPException(status_code=400, detail="channel_id must be a valid YouTube channel ID.")
+
+    try:
+        db_fs = _sync_jobs_client()
+        channel_ref = db_fs.collection(_YOUTUBE_TEST_CHANNELS_COLLECTION).document(normalized_channel_id)
+        if not channel_ref.get().exists:
+            raise HTTPException(status_code=404, detail="Temporary test channel not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unable to read temporary YouTube test channel %s", normalized_channel_id)
+        raise HTTPException(status_code=503, detail="Unable to read temporary YouTube test channel.") from exc
+
+    secret = os.environ.get("PUBSUB_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PUBSUB_SECRET is not configured.")
+
+    result = _request_youtube_subscription(
+        normalized_channel_id,
+        secret,
+        _youtube_callback_url(request),
+        "unsubscribe",
+    )
+    try:
+        batch = db_fs.batch()
+        batch.delete(channel_ref)
+        batch.delete(db_fs.collection(_YOUTUBE_SUBSCRIPTIONS_COLLECTION).document(normalized_channel_id))
+        batch.commit()
+    except Exception as exc:
+        logger.exception("Unable to delete temporary YouTube test channel %s", normalized_channel_id)
+        raise HTTPException(status_code=503, detail="Unable to delete temporary YouTube test channel.") from exc
+    return {"removed": True, "test_channel": result}
 
 
 @app.post("/youtube/resubscribe")
