@@ -5,7 +5,7 @@
 The admin panel manages the system prompt, chat history, the shared knowledge base,
 manual content ingestion, and scheduled ingestion activity. It is a single-page
 application served from `frontend-admin/index.html` and talks to the FastAPI backend
-in `server.py`.
+in `backend/server.py`.
 
 ## Authentication
 

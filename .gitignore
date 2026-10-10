@@ -25,8 +25,9 @@ cache/
 videos/
 outputs/
 links.txt
+# Keep the repository guide; ignore newly created Markdown notes and reports.
 *.md
-!ADMIN_FLOW_AND_FEATURES.md
+!README.md
 # Misc
 *.log
 .DS_Store

@@ -17,7 +17,7 @@ echo "ANTHROPIC_API_KEY=your_key" >> .env
 echo "YOUTUBE_API_KEY=optional" >> .env
 
 # 3. Run server (no auth locally)
-uvicorn server:app --reload --port 8000
+uvicorn backend.server:app --reload --port 8000
 
 # 4. Open browser
 # Chat: http://localhost:8000
@@ -25,6 +25,25 @@ uvicorn server:app --reload --port 8000
 ```
 
 **Local mode**: No Firestore needed, no password required, FAISS stored in `./rag_index/`.
+
+---
+
+## Repository Layout
+
+```text
+backend/
+  server.py                 FastAPI application and Cloud Run entrypoint
+  core/                     FAISS, chunking, orchestration, and RAG querying
+  ingestion/                Website, YouTube, and file extraction
+  services/                 Firestore-backed application services
+scripts/                    Standalone maintenance and research CLIs
+tests/manual/               Manual integration checks, including Drive access
+frontend/                   Public Vercel chat frontend
+frontend-admin/             Password-protected Vercel admin frontend
+```
+
+Run the backend with `uvicorn backend.server:app --reload --port 8000`.
+Cloud Run uses the same module through `backend.server:app` in `Dockerfile`.
 
 ---
 
@@ -39,7 +58,7 @@ uvicorn server:app --reload --port 8000
                     │ HTTPS                        │ HTTPS + Bearer token
                     ▼                              ▼
         ┌───────────────────────────────────────────────┐
-        │              server.py  (FastAPI)              │
+        │          backend/server.py (FastAPI)           │
         │  Cloud Run · gunicorn + UvicornWorker          │
         │                                                │
         │  Public routes:  /query/stream, /query,        │
@@ -51,7 +70,7 @@ uvicorn server:app --reload --port 8000
         └───────────┬────────────────────┬──────────────┘
                     │                    │
           ┌─────────▼──────┐   ┌────────▼────────────┐
-          │  orchestrator  │   │     rag_query.py     │
+          │  core/orchestrator │ │   core/rag_query.py │
           │  RAGOrchestrator│   │  RAG (Claude tool-  │
           │  Ingestion coord│   │  use + session mgmt)│
           └─────────┬──────┘   └────────┬────────────┘
@@ -59,12 +78,13 @@ uvicorn server:app --reload --port 8000
        ┌────────────┼──────┐   ┌────────▼────────────┐
        │            │      │   │  Anthropic Claude    │
        ▼            ▼      ▼   │  (claude-sonnet-4-6) │
-  scraper.py   chunker.py  │   └─────────────────────┘
+  ingestion/   core/       │   └─────────────────────┘
+  scraper.py   chunker.py  │
   PortfolioScraper │       │
   │ WebsiteCrawler │       │
   │ GeminiCleaner  │       │
   │ YT scraper     ▼       ▼
-  │            database.py (FAISSDatabase)
+  │            core/database.py (FAISSDatabase)
   │            ├─ Gemini embedding (gemini-embedding-001)
   │            ├─ FAISS IndexFlatIP (cosine similarity)
   │            └─ BM25Okapi (hybrid: 60% dense + 40% sparse)
@@ -88,7 +108,7 @@ Firestore (production persistence)
 
 ## Components
 
-### `server.py` — FastAPI Backend
+### `backend/server.py` — FastAPI Backend
 - **50+ endpoints**: Public chat, admin ingestion, auth, YouTube webhooks, session/document management.
 - **Admin auth**: Bearer token validated against Argon2 hash in Firestore (production). Auth bypassed in local dev when `GOOGLE_CLOUD_PROJECT` unset.
 - **Streaming architecture**: Anthropic SDK is blocking; `_run_llm_in_thread()` runs it in a `ThreadPoolExecutor`, feeding tokens into a thread-safe `queue.Queue`. Async `event_stream()` polls queue with short sleeps, keeping event loop responsive for other requests.
@@ -96,7 +116,7 @@ Firestore (production persistence)
 - **Session store**: Firestore (production) or in-memory dict (local dev).
 - **YouTube webhooks**: PubSubHubbub push notifications trigger auto-ingestion of new videos.
 
-### `orchestrator.py` — RAGOrchestrator
+### `backend/core/orchestrator.py` — RAGOrchestrator
 Central ingestion coordinator. Routes all content (websites, YouTube, files, raw text) through a unified pipeline:
 - **Corruption guard**: Detects binary junk (excessive control characters) and skips corrupt content
 - **Chunking**: Splits documents into 3500-token chunks with 50-token overlap
@@ -104,7 +124,7 @@ Central ingestion coordinator. Routes all content (websites, YouTube, files, raw
 - **Upsert semantics**: Deletes old chunks for the same URL before storing new ones (prevents duplicates on re-ingest)
 - **Quality filtering**: Removes chunks below minimum token count and applies optional regex/keyword filters
 
-### `scraper.py` — PortfolioScraper
+### `backend/ingestion/scraper.py` — PortfolioScraper
 Unified content extraction engine for all source types:
 - **WebsiteCrawler**: Playwright headless Chromium crawl with JS execution (expands accordions), strips navigation/footer/scripts, extracts clean Markdown
 - **GeminiCleaner**: Sends raw crawled Markdown to Gemini API for semantic cleaning (removes boilerplate, formats lists/tables)
@@ -112,7 +132,7 @@ Unified content extraction engine for all source types:
 - **File extraction (`_file_stage3_gemini()`)**: Uploads PDF/Word/PowerPoint/Excel to Gemini Files API with type-specific extraction prompts
 - **ScraperCache**: Disk cache at `./scraper_cache/` storing raw pages and video summaries. **Critical feature**: allows rebuilding the entire FAISS index with zero API calls (replay from cache)
 
-### `rag_query.py` — RAG (Claude Tool-Use + Multi-Turn)
+### `backend/core/rag_query.py` — RAG (Claude Tool-Use + Multi-Turn)
 - **Wraps FAISSDatabase + Claude**: Retrieval engine + LLM generation combined.
 - **Tool-based retrieval**: Claude is given a single tool—`search_portfolio`—which calls FAISS hybrid search. Claude decides when/how to search for follow-up context.
 - **Impersonation**: System prompt instructs Claude to embody Dr. Swati Desai's voice (warm, integrative, mindfulness-focused).
@@ -120,39 +140,39 @@ Unified content extraction engine for all source types:
 - **Streaming**: `stream_answer()` is a sync generator yielding tokens in real-time. Returns `GeminiAnswer` dataclass (answer text, sources list, token count) via `StopIteration.value`.
 - **Source tracking**: Each retrieved chunk includes title, section, URL, doc type, relevance score.
 
-### `database.py` — FAISSDatabase (Hybrid Search)
+### `backend/core/database.py` — FAISSDatabase (Hybrid Search)
 - **Embedding**: Google Gemini `gemini-embedding-001` (3072-dim). `RETRIEVAL_DOCUMENT` task for indexing, `RETRIEVAL_QUERY` for search queries.
 - **Dense index**: `faiss.IndexFlatIP` with L2-normalized vectors = cosine similarity (semantic search).
 - **Sparse index**: BM25Okapi for keyword-based retrieval.
 - **Hybrid blend**: Retrieves top-k from both indexes, min-max normalizes scores, then combines: **60% dense + 40% sparse** for final ranking.
 - **Persistence**: `faiss.index` (binary FAISS) + `metadata.pkl` (chunk metadata dict).
 
-### `chunker.py` — DocumentChunker
+### `backend/core/chunker.py` — DocumentChunker
 - Uses `langchain.RecursiveCharacterTextSplitter` (default chunk_size=3500, overlap=50).
 - Injects a metadata header into each chunk: `## Chunk N | section | title` (embedded alongside content).
 - Optional O(n²) cosine-similarity deduplication before indexing.
 
-### `firestore_sessions.py` — Session Stores
+### `backend/services/firestore_sessions.py` — Session Stores
 - `FirestoreSessionStore`: production, backed by Firestore collection `rag_sessions`.
 - `InMemorySessionStore`: local dev fallback, plain dict (lost on restart).
 - Both implement the same `SessionStore` protocol (`get`, `save`, `delete`, `list_all`).
 
-### `YoutubeScraper.py` — Standalone YouTube CLI
+### `scripts/youtube_scraper.py` — Standalone YouTube CLI
 Independent tool for scraping YouTube channels/videos to `./videos/{video_id}.json`. **Not used by the main pipeline.** Use it to pre-scrape a channel; the results can then be ingested via `/ingest/documents`.
 
 ```bash
-python YoutubeScraper.py --handle @ChannelName --max 50
-python YoutubeScraper.py --video VIDEO_ID
+python scripts/youtube_scraper.py --handle @ChannelName --max 50
+python scripts/youtube_scraper.py --video VIDEO_ID
 ```
 
-### `ProfileScraper.py` — Standalone Profile CLI
+### `scripts/research_scraper.py` — Standalone Profile CLI
 Independent tool for scraping LinkedIn-style academic profiles with Gemini-powered cleaning. **Not used by the main pipeline.**
 
-### `delete.py` — Standalone Index CLI
+### `scripts/delete_index.py` — Standalone Index CLI
 Interactive CLI for index management: delete by URL/title/section, quality filtering (repeated words, short chunks, regex), skip-list management, cache auditing.
 
 ```bash
-python delete.py
+python scripts/delete_index.py
 ```
 
 ---
@@ -168,7 +188,7 @@ python delete.py
          └──────────┴──────────┴──────────┘
                     │
                     ▼
-  server.py routes (admin-protected):
+  backend/server.py routes (admin-protected):
     POST /ingest/folder   → upload ZIP, PDF, Office files
     POST /ingest/videos   → YouTube URLs or playlists
     POST /ingest/documents→ paste raw text directly
@@ -298,13 +318,13 @@ YOUTUBE_API_KEY=your_key   # optional
 EOF
 
 # 3. Start the server (auth is bypassed locally — no password needed)
-uvicorn server:app --reload --port 8000
+uvicorn backend.server:app --reload --port 8000
 
 # 4. Open the local admin UI to ingest content
 open http://localhost:8000/admin
 
 # 5. (Optional) Use the standalone YouTube scraper
-python YoutubeScraper.py --handle @ChannelHandle --max 50
+python scripts/youtube_scraper.py --handle @ChannelHandle --max 50
 ```
 
 The local FAISS index is saved to `./rag_index/`. The scraper cache is saved to `./scraper_cache/`.
@@ -339,7 +359,7 @@ gcloud run deploy portfolio-rag \
 
 ### Gunicorn start command (in container)
 ```
-gunicorn -k uvicorn.workers.UvicornWorker server:app \
+gunicorn -k uvicorn.workers.UvicornWorker backend.server:app \
   --bind 0.0.0.0:$PORT --workers 2 --timeout 120
 ```
 

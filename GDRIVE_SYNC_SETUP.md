@@ -209,7 +209,7 @@ Store your credentials securely using environment variables.
 
 1. Take the JSON key file you downloaded in Part 1.5
 2. Rename it to: `service_account.json` (for simplicity)
-3. **Place it in your project root directory** (same folder as `server.py`)
+3. **Place it in your project root directory** (the folder containing `backend/`)
 4. ⚠️ **Important**: Add to `.gitignore` to prevent accidental commits:
    ```
    service_account.json
@@ -275,7 +275,7 @@ Verify the service account can access the Drive folder before implementing the f
 
 1. In Terminal/PowerShell, run:
    ```bash
-   python test_gdrive.py
+   python tests/manual/test_gdrive.py
    ```
 2. Expected output:
    ```
@@ -306,7 +306,7 @@ Now integrate Google Drive sync into your FastAPI application.
 
 ### Step 7.1: Add Imports & Initialization
 
-Add this to the top of `server.py` (with other imports):
+Add this to the top of `backend/server.py` (with other imports):
 
 ```python
 from google.oauth2 import service_account
@@ -781,7 +781,7 @@ After testing manually, verify the scheduler will run automatically.
 | **Permission denied (403)** | Job status shows 403 error | Ensure Cloud Run service account has permission to call the endpoint. Check Cloud Run IAM settings. |
 | **Job never runs** | Next execution keeps getting pushed back | Check cron format is valid. Verify timezone is correct. Try force-running manually. |
 | **Connection timeout** | Log shows timeout error | Cloud Run service may be sleeping. Call the endpoint manually to wake it up. Check if service account has permissions. |
-| **404 endpoint not found** | Job returns 404 error | Verify `/gdrive/sync` endpoint exists in `server.py`. Check Cloud Run service is deployed. |
+| **404 endpoint not found** | Job returns 404 error | Verify `/gdrive/sync` endpoint exists in `backend/server.py`. Check Cloud Run service is deployed. |
 | **Wrong authentication type** | Job shows auth failures | Ensure you used **OIDC token**, not "Add basic auth". Verify service account email is correct. |
 
 ---
@@ -977,13 +977,13 @@ GOOGLE_CLOUD_PROJECT=
 
 1. Run test script:
    ```bash
-   python test_gdrive.py
+   python tests/manual/test_gdrive.py
    ```
    Expected: Lists files in your Drive folder
 
 2. Start server locally:
    ```bash
-   uvicorn server:app --reload --port 8000
+   uvicorn backend.server:app --reload --port 8000
    ```
 
 3. Test sync endpoint:
@@ -1028,7 +1028,7 @@ GOOGLE_CLOUD_PROJECT=
 **Cause:** JSON file not in project root.
 
 **Fix:**
-1. Move `service_account.json` to project root (same folder as `server.py`)
+1. Move `service_account.json` to project root (the folder containing `backend/`)
 2. Or update `.env`: `GDRIVE_SERVICE_ACCOUNT_FILE=/path/to/service_account.json`
 
 ### Issue: Sync endpoint returns "GDRIVE_FOLDER_ID not set"
@@ -1070,7 +1070,7 @@ GOOGLE_CLOUD_PROJECT=
 **Cause:** The `/gdrive/sync` endpoint doesn't exist or the URL is wrong.
 
 **Fix:**
-1. Verify the endpoint exists in `server.py` (look for `@app.post("/gdrive/sync")`)
+1. Verify the endpoint exists in `backend/server.py` (look for `@app.post("/gdrive/sync")`)
 2. If not present, re-do Part 7 (Implement Sync Endpoint)
 3. Verify Cloud Run has the latest code deployed
 4. Verify the URL in scheduler is exactly: `{YOUR_CLOUD_RUN_URL}/gdrive/sync`
@@ -1122,7 +1122,7 @@ After completing setup, you should have:
 - [ ] `.env` file with `GDRIVE_FOLDER_ID` and `GDRIVE_SERVICE_ACCOUNT_FILE`
 - [ ] Updated `requirements.txt` with Google Drive API packages
 - [ ] `test_gdrive.py` for local testing (verified successful run)
-- [ ] Updated `server.py` with sync endpoint code
+- [ ] Updated `backend/server.py` with sync endpoint code
 
 **Production Deployment:**
 - [ ] Updated `cloudbuild.yaml` with substitutions (for production)

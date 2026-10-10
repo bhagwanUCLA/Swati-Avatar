@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-uvicorn server:app --reload --port 8000
+uvicorn backend.server:app --reload --port 8000
 ```
 
 - Open `http://localhost:8000/admin` for the local ingest UI
@@ -69,15 +69,15 @@ server.py (FastAPI on Cloud Run, gunicorn + UvicornWorker, 2 workers)
 
 ## Key Files
 
-**`server.py`** — All API routes. Streaming works by running the synchronous Anthropic SDK in a `ThreadPoolExecutor` and feeding tokens into a `queue.Queue` that the async SSE handler polls.
+**`backend/server.py`** — All API routes. Streaming works by running the synchronous Anthropic SDK in a `ThreadPoolExecutor` and feeding tokens into a `queue.Queue` that the async SSE handler polls.
 
-**`rag_query.py`** — Claude is given one tool: `search_portfolio` (calls FAISS hybrid search). Multi-turn history is injected via the session store. `stream_answer()` yields text tokens; the final `GeminiAnswer` comes back via `StopIteration.value`.
+**`backend/core/rag_query.py`** — Claude is given one tool: `search_portfolio` (calls FAISS hybrid search). Multi-turn history is injected via the session store. `stream_answer()` yields text tokens; the final `GeminiAnswer` comes back via `StopIteration.value`.
 
-**`database.py`** — Gemini `gemini-embedding-001` (3072-dim), `faiss.IndexFlatIP` with L2-normalized vectors (= cosine similarity), BM25Okapi. Hybrid blend: **60% dense + 40% sparse**.
+**`backend/core/database.py`** — Gemini `gemini-embedding-001` (3072-dim), `faiss.IndexFlatIP` with L2-normalized vectors (= cosine similarity), BM25Okapi. Hybrid blend: **60% dense + 40% sparse**.
 
-**`orchestrator.py`** — All ingestion paths go through `_store_docs()`: corruption guard → chunk → optional embedding dedup → upsert (deletes old chunks for same URL first) → remove short chunks.
+**`backend/core/orchestrator.py`** — All ingestion paths go through `_store_docs()`: corruption guard → chunk → optional embedding dedup → upsert (deletes old chunks for same URL first) → remove short chunks.
 
-**`scraper.py`** — Playwright headless Chromium for websites; Gemini Files API for PDFs/Office; YouTube Data API v3 + transcript fallback to Gemini native video URL. `ScraperCache` in `./scraper_cache/` lets you rebuild the FAISS index with zero API calls.
+**`backend/ingestion/scraper.py`** — Playwright headless Chromium for websites; Gemini Files API for PDFs/Office; YouTube Data API v3 + transcript fallback to Gemini native video URL. `ScraperCache` in `./scraper_cache/` lets you rebuild the FAISS index with zero API calls.
 
 **`cloudbuild.yaml`** — CI/CD for Cloud Run. Sets `GOOGLE_CLOUD_PROJECT`, `GCS_BUCKET`, `FIRESTORE_DB` as env vars. API keys (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `YOUTUBE_API_KEY`) must be added manually in the Cloud Run console — they survive redeploys.
 
@@ -108,6 +108,6 @@ Cloud Run service account needs: `roles/datastore.user` + `roles/storage.objectA
 ## Standalone CLI Tools (not part of main pipeline)
 
 ```bash
-python YoutubeScraper.py --handle @ChannelHandle --max 50  # pre-scrape YouTube
-python delete.py                                            # interactive index management
+python scripts/youtube_scraper.py --handle @ChannelHandle --max 50  # pre-scrape YouTube
+python scripts/delete_index.py                                      # interactive index management
 ```
