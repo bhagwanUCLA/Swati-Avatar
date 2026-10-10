@@ -134,9 +134,11 @@ Unified content extraction engine for all source types:
 
 ### `backend/core/rag_query.py` — RAG (Claude Tool-Use + Multi-Turn)
 - **Wraps FAISSDatabase + Claude**: Retrieval engine + LLM generation combined.
-- **Tool-based retrieval**: Claude is given a single tool—`search_portfolio`—which calls FAISS hybrid search. Claude decides when/how to search for follow-up context.
+- **Tool-based retrieval**: Claude is given a single tool—`search_portfolio`—which calls FAISS hybrid search. The system prompt instructs Claude to call it for every user query and answer only from relevant returned data.
 - **Impersonation**: System prompt instructs Claude to embody Dr. Swati Desai's voice (warm, integrative, mindfulness-focused).
 - **Session management**: Multi-turn chat history injected from session store (Firestore/in-memory).
+- **Context-window management**: Before each Claude request, the Anthropic token-count API measures the exact request against the selected model's retrieved input limit. The temporary request drops oldest complete user/assistant pairs as needed while reserving 2,048 output tokens; saved session history is unchanged.
+- **Prompt caching**: Anthropic automatic prompt caching is enabled for the system prompt, tool definition, and growing request history.
 - **Streaming**: `stream_answer()` is a sync generator yielding tokens in real-time. Returns `GeminiAnswer` dataclass (answer text, sources list, token count) via `StopIteration.value`.
 - **Source tracking**: Each retrieved chunk includes title, section, URL, doc type, relevance score.
 
@@ -225,7 +227,7 @@ When a user asks a question via `/query/stream` or `/query`:
 1. SESSION LOOKUP
    └─ Retrieve chat history from Firestore/in-memory store
 
-2. HYBRID SEARCH (Claude via tool-use)
+2. HYBRID SEARCH (Claude via `search_portfolio`)
    └─ Query embedded via Gemini API (3072-dim)
    └─ Search FAISS index (semantic): top-k results
    └─ Search BM25 index (keyword): top-k results
@@ -234,10 +236,11 @@ When a user asks a question via `/query/stream` or `/query`:
 
 3. CLAUDE GENERATION
    └─ System prompt: impersonate Dr. Swati
-   └─ Context: last 10 messages (multi-turn history)
-   └─ Retrieved chunks injected into context
-   └─ Claude calls search_portfolio tool if needs more context
-   └─ Generate response with streaming tokens
+   └─ Context: saved multi-turn history, temporarily trimmed only if needed
+      to fit the selected model's input limit while reserving 2,048 output tokens
+   └─ Claude is instructed to call search_portfolio for the user query;
+      relevant chunks are returned through the tool
+   └─ Generate response with streaming tokens and automatic prompt caching
 
 4. RESPONSE + SOURCES
    └─ Stream tokens via SSE (Server-Sent Events)
@@ -453,7 +456,7 @@ by the API.
 
 ### **Architecture & Performance**
 - **Sync LLM in thread pool**: Anthropic SDK is blocking/synchronous. Running it in `ThreadPoolExecutor` prevents freezing the asyncio event loop on long queries—critical for scaling across concurrent users.
-- **Gunicorn + UvicornWorker (2 workers)**: Parallel request handling; each worker has its own thread pool for LLM calls.
+- **Gunicorn + UvicornWorker (1 worker)**: One application process owns the in-process background worker and index state.
 - **GCS ephemeral persistence**: Cloud Run containers are stateless/ephemeral. FAISS index downloaded on startup, uploaded after each ingest—survives restarts without redeployment.
 
 ### **Search & Retrieval**
@@ -467,6 +470,6 @@ by the API.
 - **Skip list**: Manually ingested raw documents are marked so portfolio crawls don't overwrite them.
 
 ### **User Experience**
-- **Multi-turn sessions**: Chat history persisted per session ID; Claude sees last 10 messages for context.
+- **Multi-turn sessions**: Chat history is persisted per session ID. Each request uses exact token counting and temporarily removes oldest complete user/assistant pairs only when required by the selected model's context limit.
 - **Source attribution**: Every response includes chunk provenance (title, section, URL, relevance score).
-- **Tool-based retrieval**: Claude decides *when* and *what* to search via `search_portfolio` tool—enabling follow-up research without user intervention.
+- **Tool-based retrieval**: Claude is instructed to call `search_portfolio` for every user query and answer only from relevant returned retrieval data.
