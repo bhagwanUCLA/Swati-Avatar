@@ -358,23 +358,36 @@ class RAG:
         default_section: Optional[str],
         default_doc_type: Optional[str],
         on_chunks: Optional[Callable[[list[dict]], None]] = None,
-    ) -> tuple[str, list[Source]]:
+    ) -> tuple[str, list[Source], bool]:
         query    = tool_input.get("query", "")
         top_k    = int(tool_input.get("top_k", default_top_k))
         section  = tool_input.get("section_filter") or default_section
         doc_type = tool_input.get("doc_type_filter") or default_doc_type
 
-        results = self._retrieve(query, top_k, section, doc_type)
+        try:
+            results = self._retrieve(query, top_k, section, doc_type)
+        except Exception:
+            logger.exception("search_portfolio failed")
+            if on_chunks:
+                on_chunks([])
+            return (
+                "The portfolio search service is temporarily unavailable, so no "
+                "source material was returned. Continue without treating this as "
+                "evidence; be transparent that sources could not be retrieved.",
+                [],
+                True,
+            )
+
         if not results:
             if on_chunks:
                 on_chunks([])
-            return "No relevant chunks found for this query.", []
+            return "No relevant chunks found for this query.", [], False
 
         # Notify caller with the raw result dicts before building context
         if on_chunks:
             on_chunks(results)
 
-        return _build_context_block(results), _extract_sources(results)
+        return _build_context_block(results), _extract_sources(results), False
 
     # ------------------------------------------------------------------
     # Public API — answer()
@@ -444,15 +457,18 @@ class RAG:
                             continue
                         if block.name == "search_portfolio":
                             logger.info("Tool call: %s", json.dumps(dict(block.input)))
-                            context, sources = self._run_search_tool(
+                            context, sources, tool_failed = self._run_search_tool(
                                 dict(block.input), k, section_filter, doc_type_filter
                             )
                             all_sources.extend(sources)
-                            tool_results.append({
+                            tool_result = {
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": context,
-                            })
+                            }
+                            if tool_failed:
+                                tool_result["is_error"] = True
+                            tool_results.append(tool_result)
                         else:
                             tool_results.append({
                                 "type": "tool_result",
@@ -588,7 +604,7 @@ class RAG:
                             continue
                         if block.name == "search_portfolio":
                             logger.info("Tool call: %s", json.dumps(dict(block.input)))
-                            context, sources = self._run_search_tool(
+                            context, sources, tool_failed = self._run_search_tool(
                                 dict(block.input),
                                 default_top_k,
                                 default_section,
@@ -596,11 +612,14 @@ class RAG:
                                 on_chunks=on_chunks,
                             )
                             all_sources.extend(sources)
-                            tool_results.append({
+                            tool_result = {
                                 "type":        "tool_result",
                                 "tool_use_id": block.id,
                                 "content":     context,
-                            })
+                            }
+                            if tool_failed:
+                                tool_result["is_error"] = True
+                            tool_results.append(tool_result)
                         else:
                             tool_results.append({
                                 "type":        "tool_result",

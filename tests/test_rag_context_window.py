@@ -20,6 +20,11 @@ class FakeClient:
     messages = FakeMessages()
 
 
+class FailingDatabase:
+    def search(self, question, **kwargs):
+        raise RuntimeError("embedding provider unavailable")
+
+
 class ContextWindowTests(unittest.TestCase):
     def setUp(self):
         self.rag = RAG(db=None, model="test-model", session_store=InMemorySessionStore())
@@ -64,6 +69,20 @@ class ContextWindowTests(unittest.TestCase):
                 [],
                 self.rag._model_input_limit(client),
             )
+
+    def test_search_failure_is_returned_as_a_tool_error(self):
+        rag = RAG(db=FailingDatabase(), session_store=InMemorySessionStore())
+
+        content, sources, failed = rag._run_search_tool(
+            {"query": "mindfulness"},
+            default_top_k=6,
+            default_section=None,
+            default_doc_type=None,
+        )
+
+        self.assertTrue(failed)
+        self.assertEqual(sources, [])
+        self.assertIn("temporarily unavailable", content)
 
 
 if __name__ == "__main__":

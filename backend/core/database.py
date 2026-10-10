@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+class _MetadataUnpickler(pickle.Unpickler):
+    """Load metadata written before the Python modules were reorganized."""
+
+    def find_class(self, module: str, name: str):
+        if module == "chunker" and name == "DocumentChunk":
+            return DocumentChunk
+        return super().find_class(module, name)
+
+
+def _load_metadata_pickle(file_handle) -> dict:
+    return _MetadataUnpickler(file_handle).load()
+
 def _l2_normalise(vectors: np.ndarray) -> np.ndarray:
     """Row-wise L2 normalisation. Safe: zero rows stay zero."""
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -418,7 +430,7 @@ class FAISSDatabase:
             raise FileNotFoundError(f"No saved index found in {directory!r}")
         self._index = faiss.read_index(str(index_file))
         with open(meta_file, "rb") as f:
-            state = pickle.load(f)
+            state = _load_metadata_pickle(f)
         self._meta    = state["meta"]
         self._next_id = state["next_id"]
         
