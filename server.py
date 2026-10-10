@@ -1929,11 +1929,6 @@ class VideosIngestRequest(BaseModel):
     section: str = "video"
 
 
-class YouTubeBackfillRequest(BaseModel):
-    channel_id: str = Field(min_length=1, max_length=100)
-    limit: int = Field(default=52, ge=1, le=500)
-
-
 class CleanupRequest(BaseModel):
     repeated_word_enabled:    bool        = False
     repeated_word_min_length: int         = 4
@@ -3150,72 +3145,6 @@ def _request_youtube_subscription(
         }
 
 
-def _youtube_api_get(path: str, params: dict) -> dict:
-    try:
-        response = _req.get(
-            f"https://www.googleapis.com/youtube/v3/{path}",
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (_req.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="YouTube Data API request failed.") from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="YouTube Data API returned an invalid response.")
-    return data
-
-
-def _youtube_upload_items(channel_id: str, api_key: str, limit: int) -> list[dict]:
-    channel_data = _youtube_api_get("channels", {
-        "part": "contentDetails",
-        "id": channel_id,
-        "key": api_key,
-    })
-    channels = channel_data.get("items") or []
-    if not channels:
-        raise HTTPException(status_code=404, detail="Configured YouTube channel was not found.")
-
-    uploads_playlist_id = (
-        channels[0].get("contentDetails", {})
-        .get("relatedPlaylists", {})
-        .get("uploads", "")
-    )
-    if not uploads_playlist_id:
-        raise HTTPException(status_code=502, detail="YouTube channel has no uploads playlist.")
-
-    items = []
-    page_token = None
-    while len(items) < limit:
-        params = {
-            "part": "snippet,contentDetails",
-            "playlistId": uploads_playlist_id,
-            "maxResults": min(50, limit - len(items)),
-            "key": api_key,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        page_data = _youtube_api_get("playlistItems", params)
-        for playlist_item in page_data.get("items") or []:
-            snippet = playlist_item.get("snippet") or {}
-            content_details = playlist_item.get("contentDetails") or {}
-            video_id = str((snippet.get("resourceId") or {}).get("videoId") or "").strip()
-            if not video_id:
-                continue
-            title = str(snippet.get("title") or video_id).strip()
-            items.append({
-                "source_id": video_id,
-                "name": title,
-                "created_time": content_details.get("videoPublishedAt") or snippet.get("publishedAt"),
-                "metadata": {"title": title, "channel_id": channel_id, "backfill": True},
-            })
-            if len(items) >= limit:
-                break
-        page_token = page_data.get("nextPageToken")
-        if not page_token:
-            break
-    return items
-
 @app.get("/youtube/notify")
 async def youtube_verify(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
@@ -3338,41 +3267,6 @@ async def youtube_notify(request: Request):
     _wake_sync_worker()
 
     return Response(status_code=204)
-
-
-@app.post("/youtube/backfill")
-def youtube_backfill(body: YouTubeBackfillRequest, _: AdminDep):
-    """Queue recent uploads from one permanently configured YouTube channel."""
-    channel_id = body.channel_id.strip()
-    if channel_id not in _configured_youtube_channel_ids():
-        raise HTTPException(status_code=400, detail="channel_id is not configured in WATCHED_CHANNEL_IDS.")
-
-    api_key = str(_current_config.get("youtube_api_key") or "").strip()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="YOUTUBE_API_KEY is not configured.")
-
-    items = _youtube_upload_items(channel_id, api_key, body.limit)
-    job_id = _create_sync_job("youtube", metadata={
-        "submission": "channel_backfill",
-        "channel_id": channel_id,
-        "requested_limit": body.limit,
-        "discovered": len(items),
-    })
-    try:
-        queued = _add_sync_job_items(job_id, "youtube", items)
-    except Exception as exc:
-        logger.exception("Unable to queue YouTube backfill for %s", channel_id)
-        raise HTTPException(status_code=503, detail="Unable to queue YouTube backfill.") from exc
-
-    if queued:
-        _wake_sync_worker()
-    return {
-        "channel_id": channel_id,
-        "discovered": len(items),
-        "queued": queued,
-        "already_recorded": len(items) - queued,
-        "job_id": job_id,
-    }
 
 
 @app.post("/youtube/resubscribe")
