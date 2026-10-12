@@ -654,17 +654,16 @@
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
         <div>
-          <div class="card-title" style="margin:0">Scheduled Queue &amp; Activity</div>
+          <div class="card-title" style="margin:0">Scheduled Jobs &amp; Activity</div>
           <div id="sync-jobs-total-label" style="font-size:12px;color:var(--muted);margin-top:2px"></div>
           <div id="sync-queue-state" style="font-size:12px;color:var(--muted);margin-top:2px"></div>
         </div>
         <div class="btn-group" style="margin:0">
-          <button class="btn btn-sm" id="sync-start-btn" style="display:none" onclick="startSyncQueue()">Start Queue</button>
-          <button class="btn btn-sm" id="sync-pause-btn" style="display:none" onclick="pauseSyncQueue()">Pause Queue</button>
+          <button class="btn btn-sm" id="sync-toggle-btn" onclick="toggleSyncQueue()">Start Jobs</button>
           <button class="btn btn-sm" onclick="refreshSyncJobs()">↺ Refresh</button>
         </div>
       </div>
-      <p class="hint">Newest items appear first. This is one shared queue and activity log; source identifies where each item came from. A deployment pauses unfinished work; choose Start Queue to resume it.</p>
+      <p class="hint">Newest items appear first. This is one shared scheduled-job activity log; source identifies where each item came from. A deployment pauses unfinished work; choose Start Jobs to resume it.</p>
       <div id="sync-jobs-status" class="chats-status" style="display:none"></div>
       <div id="sync-jobs-list"></div>
       <div class="btn-group" style="margin-top:14px;justify-content:center">
@@ -1463,17 +1462,25 @@ async function removeSyncJobItem(jobId, itemId) {
 
 function renderSyncQueueControls(queue) {
   const stateEl = document.getElementById('sync-queue-state');
-  const startBtn = document.getElementById('sync-start-btn');
-  const pauseBtn = document.getElementById('sync-pause-btn');
+  const toggleBtn = document.getElementById('sync-toggle-btn');
   const counts = queue.counts || {};
   const isRunning = queue.state === 'running';
-  stateEl.textContent = `Queue ${isRunning ? 'running' : 'paused'} · paused: ${counts.paused || 0}, pending: ${counts.pending || 0}, processing: ${counts.processing || 0}, failed: ${counts.failed || 0}, completed: ${counts.completed || 0}`;
-  startBtn.style.display = isRunning ? 'none' : 'inline-flex';
-  pauseBtn.style.display = isRunning ? 'inline-flex' : 'none';
+  const statusCounts = ['paused', 'pending', 'processing', 'failed', 'completed']
+    .map(name => `<strong>${name}: ${Number(counts[name] || 0).toLocaleString()}</strong>`)
+    .join(', ');
+  stateEl.innerHTML = `Scheduled jobs <strong>${isRunning ? 'running' : 'paused'}</strong> · ${statusCounts}`;
+  toggleBtn.dataset.state = isRunning ? 'running' : 'paused';
+  toggleBtn.textContent = isRunning ? 'Pause Jobs' : 'Start Jobs';
+}
+
+function toggleSyncQueue() {
+  const state = document.getElementById('sync-toggle-btn').dataset.state;
+  if (state === 'running') pauseSyncQueue();
+  else startSyncQueue();
 }
 
 async function pauseSyncQueue() {
-  if (!confirm('Pause the queue? Pending and failed items will pause; an item already processing will finish or fail safely.')) return;
+  if (!confirm('Pause scheduled jobs? Pending and failed items will pause; an item already processing will finish or fail safely.')) return;
   try {
     const response = await authFetch(`${API}/sync-queue/pause`, { method: 'POST' });
     if (!response.ok) throw new Error(await syncJobError(response));
@@ -1484,7 +1491,7 @@ async function pauseSyncQueue() {
 }
 
 async function startSyncQueue() {
-  if (!confirm('Start the queue and resume all paused items?')) return;
+  if (!confirm('Start scheduled jobs and resume all paused items?')) return;
   try {
     const response = await authFetch(`${API}/sync-queue/start`, { method: 'POST' });
     if (!response.ok) throw new Error(await syncJobError(response));
