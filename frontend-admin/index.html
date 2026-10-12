@@ -806,6 +806,29 @@ const API = 'https://swati-avatar-578167174494.asia-south1.run.app';   // Cloud 
 
 function getToken() { return sessionStorage.getItem('admin_token') || ''; }
 
+function tokenHasExpired(token) {
+  try {
+    const payload = token.split('.')[1];
+    if (!payload) return false;
+    const decoded = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+    const { exp } = JSON.parse(decoded);
+    return typeof exp === 'number' && Date.now() >= exp * 1000;
+  } catch {
+    return false;
+  }
+}
+
+function showLoginRequired(message) {
+  sessionStorage.removeItem('admin_token');
+  document.getElementById('login-token').value = '';
+  document.getElementById('login-error').textContent = message;
+  document.getElementById('login-overlay').style.display = 'flex';
+  document.getElementById('login-box').style.display = 'block';
+  document.getElementById('setup-box').style.display = 'none';
+  document.getElementById('forgot-box').style.display = 'none';
+  document.getElementById('reset-box').style.display = 'none';
+}
+
 function togglePassword(inputId, button) {
   const input = document.getElementById(inputId);
   const isHidden = input.type === 'password';
@@ -820,20 +843,19 @@ function togglePassword(inputId, button) {
  * Automatically handles 401 Unauthorized by redirecting to login.
  */
 async function authFetch(url, opts = {}) {
+  const token = getToken();
   opts.headers = Object.assign({}, opts.headers);
-  opts.headers['Authorization'] = 'Bearer ' + getToken();
+  if (token) opts.headers['Authorization'] = 'Bearer ' + token;
   const res = await fetch(url, opts);
 
-  // If token is expired/invalid (401), redirect to login
+  // A 401 always needs a fresh login, but only an expired JWT is labelled expired.
   if (res.status === 401) {
-    sessionStorage.removeItem('admin_token');
-    document.getElementById('login-token').value = '';
-    document.getElementById('login-error').textContent = 'Session expired. Please log in again.';
-    document.getElementById('login-overlay').style.display = 'flex';
-    document.getElementById('login-box').style.display = 'block';
-    document.getElementById('setup-box').style.display = 'none';
-    document.getElementById('forgot-box').style.display = 'none';
-    document.getElementById('reset-box').style.display = 'none';
+    const message = tokenHasExpired(token)
+      ? 'Session expired. Please log in again.'
+      : token
+        ? 'Your sign-in could not be validated. Please log in again.'
+        : 'Please log in to continue.';
+    showLoginRequired(message);
   }
 
   return res;
@@ -946,10 +968,13 @@ async function initAuth() {
   }
 
   // 2. Normal login flow
-  if (!getToken()) {
+  const savedToken = getToken();
+  if (!savedToken) {
     document.getElementById('login-overlay').style.display = 'flex';
     document.getElementById('login-box').style.display = 'block';
     document.getElementById('setup-box').style.display = 'none';
+  } else if (tokenHasExpired(savedToken)) {
+    showLoginRequired('Session expired. Please log in again.');
   } else {
     document.getElementById('login-overlay').style.display = 'none';
     initModelSelector();
