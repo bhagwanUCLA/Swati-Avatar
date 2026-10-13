@@ -36,6 +36,7 @@ for local development, but histories are lost on restart.
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import contextlib
 import functools
@@ -67,6 +68,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Pla
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
+from cryptography.fernet import Fernet, InvalidToken
 import tempfile
 import zipfile
 
@@ -92,6 +94,39 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+_ENCRYPTED_GEMINI_KEY_PATH = _PROJECT_ROOT / "backend" / "config" / "gemini_api_key.enc"
+_GEMINI_KEY_ENCRYPTION_INFO = b"swati-rag/gemini-api-key/v1"
+
+
+def _load_deployed_gemini_api_key() -> str:
+    """Prefer the repository-encrypted Gemini key when the artifact exists."""
+    if not _ENCRYPTED_GEMINI_KEY_PATH.exists():
+        return os.environ.get("GEMINI_API_KEY", "")
+
+    youtube_api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not youtube_api_key:
+        raise RuntimeError(
+            "Encrypted Gemini key is present but YOUTUBE_API_KEY is not configured."
+        )
+
+    key_material = hashlib.sha256(
+        _GEMINI_KEY_ENCRYPTION_INFO + youtube_api_key.encode("utf-8")
+    ).digest()
+    fernet_key = base64.urlsafe_b64encode(key_material)
+    try:
+        encrypted_key = _ENCRYPTED_GEMINI_KEY_PATH.read_bytes().strip()
+        gemini_api_key = Fernet(fernet_key).decrypt(encrypted_key).decode("utf-8").strip()
+    except (OSError, InvalidToken, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "Encrypted Gemini key could not be decrypted with YOUTUBE_API_KEY."
+        ) from exc
+
+    if not gemini_api_key:
+        raise RuntimeError("Encrypted Gemini key is empty.")
+
+    logger.info("Using encrypted Gemini API key deployment override.")
+    return gemini_api_key
 
 app = FastAPI(title="Portfolio RAG API", version="3.0")
 
@@ -394,7 +429,7 @@ async def _send_reset_email(reset_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_CONFIG = {
-    "gemini_api_key":    os.environ.get("GEMINI_API_KEY", ""),
+    "gemini_api_key":    _load_deployed_gemini_api_key(),
     "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
     "youtube_api_key":   os.environ.get("YOUTUBE_API_KEY", ""),
     "hf_model_name":     "gemini-embedding-001",
