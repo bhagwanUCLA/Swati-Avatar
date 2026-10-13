@@ -189,7 +189,13 @@ class RAGOrchestrator:
         to their individual videos before summarisation.
         """
         docs = self.scraper.summarise_videos(youtube_urls, section=section)
-        return self._store_docs(docs)
+        chunks_stored = self._store_docs(docs)
+        if chunks_stored <= 0:
+            raise RuntimeError(
+                "YouTube content was extracted but produced no indexable chunks. "
+                f"The content may be corrupt or below the {self.min_tokens}-word minimum."
+            )
+        return chunks_stored
 
     # ------------------------------------------------------------------
     # Skip-list management

@@ -60,7 +60,7 @@
     display: flex; align-items: center; padding: 0 20px;
     border-bottom: 1px solid rgba(255,255,255,0.15);
     background: #2c5530;
-    margin-bottom: 28px;
+    margin-bottom: 0;
   }
   .logo { display: flex; align-items: center; gap: 10px; }
   .logo img { height: 32px; width: auto; object-fit: contain; filter: brightness(0) invert(1); }
@@ -496,7 +496,6 @@
     <button class="tab" onclick="switchTab(event, 'documents')">Paste Text</button>
     <button class="tab" onclick="switchTab(event, 'folder')">File / Zip</button>
     <button class="tab" onclick="switchTab(event, 'videos')">Videos</button>
-    <button class="tab" onclick="switchTab(event, 'cleanup')">Cleanup</button>
   </div>
 
   <!-- ── PASTE DOCUMENTS (with inline cleaner) ── -->
@@ -690,112 +689,6 @@
       <button class="btn" onclick="loadIndex()">↺ Refresh</button>
     </div>
   </div>
-
-  <!-- ── CLEANUP ── -->
-  <div id="panel-cleanup" class="panel">
-
-    <div class="card">
-      <div class="card-title">Filters</div>
-
-      <!-- Repeated word -->
-      <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:12px">
-        <label style="display:flex;align-items:center;gap:7px;margin-bottom:10px;cursor:pointer">
-          <input type="checkbox" id="cl-rep-enabled" onchange="toggleSection('rep')">
-          <span style="font-weight:600">Repeated-word filter</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">— delete chunks where one word appears too many times</span>
-        </label>
-        <div id="cl-rep-opts" style="display:none">
-          <div class="row">
-            <div>
-              <label>Min word length (letters)</label>
-              <div class="hint">Ignore short words like "the", "and". Only count words with at least this many letters.</div>
-              <div style="display:flex;align-items:center;gap:10px">
-                <input type="range" id="cl-rep-len" min="2" max="12" value="4" oninput="syncRange('rep-len')" style="flex:1;margin:0">
-                <span id="cl-rep-len-val" style="font-size:13px;font-weight:600;min-width:24px">4</span>
-              </div>
-            </div>
-            <div>
-              <label>Min repetitions to flag</label>
-              <div class="hint">If a qualifying word appears this many times or more, delete the chunk.</div>
-              <div style="display:flex;align-items:center;gap:10px">
-                <input type="range" id="cl-rep-cnt" min="2" max="30" value="6" oninput="syncRange('rep-cnt')" style="flex:1;margin:0">
-                <span id="cl-rep-cnt-val" style="font-size:13px;font-weight:600;min-width:24px">6</span>
-              </div>
-            </div>
-          </div>
-          <div style="margin-top:12px">
-            <label>Sliding window size <span style="font-weight:400;color:var(--muted)">(0 = whole chunk)</span></label>
-            <div class="hint">Check only within any consecutive N-word window instead of the whole chunk. Useful for catching local repetition in long chunks.</div>
-            <div style="display:flex;align-items:center;gap:10px">
-              <input type="range" id="cl-rep-win" min="0" max="100" value="0" oninput="syncRange('rep-win')" style="flex:1;margin:0">
-              <span id="cl-rep-win-val" style="font-size:13px;font-weight:600;min-width:30px">0 (off)</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Short chunk -->
-      <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:12px">
-        <label style="display:flex;align-items:center;gap:7px;margin-bottom:10px;cursor:pointer">
-          <input type="checkbox" id="cl-short-enabled" onchange="toggleSection('short')">
-          <span style="font-weight:600">Short-chunk filter</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">— delete chunks that are too small to be useful</span>
-        </label>
-        <div id="cl-short-opts" style="display:none">
-          <div class="row">
-            <div>
-              <label>Min tokens (words)</label>
-              <div style="display:flex;align-items:center;gap:10px">
-                <input type="range" id="cl-short-tok" min="1" max="100" value="20" oninput="syncRange('short-tok')" style="flex:1;margin:0">
-                <span id="cl-short-tok-val" style="font-size:13px;font-weight:600;min-width:30px">20</span>
-              </div>
-            </div>
-            <div>
-              <label>Min characters</label>
-              <div style="display:flex;align-items:center;gap:10px">
-                <input type="range" id="cl-short-chr" min="10" max="500" value="50" oninput="syncRange('short-chr')" style="flex:1;margin:0">
-                <span id="cl-short-chr-val" style="font-size:13px;font-weight:600;min-width:30px">50</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Regex -->
-      <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:12px">
-        <label style="display:flex;align-items:center;gap:7px;margin-bottom:10px;cursor:pointer">
-          <input type="checkbox" id="cl-regex-enabled" onchange="toggleSection('regex')">
-          <span style="font-weight:600">Regex pattern filter</span>
-          <span style="font-size:11px;color:var(--muted);font-weight:400">— delete chunks matching custom patterns</span>
-        </label>
-        <div id="cl-regex-opts" style="display:none">
-          <label>Patterns (one per line)</label>
-          <div class="hint">Each line is a Python regex. A chunk matching ANY pattern is deleted. Example: <code>\b(lorem|ipsum)\b</code></div>
-          <textarea id="cl-regex-pats" style="height:90px;margin-bottom:0" placeholder="\b(lorem|ipsum)\b
-^\s*$
-copyright \d{4}"></textarea>
-        </div>
-      </div>
-
-      <div class="btn-group" style="margin-top:4px">
-        <button class="btn" onclick="cleanupPreview()">
-          <span id="cl-preview-spinner"></span> Preview (dry run)
-        </button>
-        <button class="btn btn-primary" id="cl-apply-btn" style="display:none" onclick="cleanupApply()">
-          <span id="cl-apply-spinner"></span> Delete these chunks
-        </button>
-      </div>
-    </div>
-
-    <!-- Preview results -->
-    <div id="cl-preview-card" class="card" style="display:none">
-      <div class="card-title">Preview results</div>
-      <div id="cl-summary" style="margin-bottom:14px;font-size:13px"></div>
-      <div id="cl-samples" style="display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto"></div>
-    </div>
-    <div id="cl-toast" class="toast"></div>
-  </div>
-
 </div>
 
 <script>
@@ -1773,121 +1666,6 @@ async function saveSystemPrompt() {
 // Call loadSystemPrompt when prompt tab is opened
 function onPromptTabOpen() {
   if (getToken()) loadSystemPrompt();
-}
-
-// ── CLEANUP ──────────────────────────────────────────────────────────────
-function toggleSection(name) {
-  const enabled = document.getElementById('cl-' + name + '-enabled').checked;
-  document.getElementById('cl-' + name + '-opts').style.display = enabled ? 'block' : 'none';
-  // hide apply button when filters change
-  document.getElementById('cl-apply-btn').style.display = 'none';
-  document.getElementById('cl-preview-card').style.display = 'none';
-}
-
-function syncRange(id) {
-  const val = document.getElementById('cl-' + id).value;
-  const label = id === 'rep-win'
-    ? (val === '0' ? '0 (off)' : val)
-    : val;
-  document.getElementById('cl-' + id + '-val').textContent = label;
-  // hide apply button when params change
-  document.getElementById('cl-apply-btn').style.display = 'none';
-}
-
-// attach range listeners
-['rep-len','rep-cnt','rep-win','short-tok','short-chr'].forEach(id => {
-  const el = document.getElementById('cl-' + id);
-  if (el) el.addEventListener('input', () => {
-    document.getElementById('cl-apply-btn').style.display = 'none';
-    document.getElementById('cl-preview-card').style.display = 'none';
-  });
-});
-
-function buildCleanupReq() {
-  const pats = document.getElementById('cl-regex-pats').value
-    .split('\n').map(l => l.trim()).filter(Boolean);
-  return {
-    repeated_word_enabled:    document.getElementById('cl-rep-enabled').checked,
-    repeated_word_min_length: parseInt(document.getElementById('cl-rep-len').value),
-    repeated_word_min_count:  parseInt(document.getElementById('cl-rep-cnt').value),
-    repeated_word_window:     parseInt(document.getElementById('cl-rep-win').value),
-    short_chunk_enabled:      document.getElementById('cl-short-enabled').checked,
-    short_min_tokens:         parseInt(document.getElementById('cl-short-tok').value),
-    short_min_chars:          parseInt(document.getElementById('cl-short-chr').value),
-    regex_enabled:            document.getElementById('cl-regex-enabled').checked,
-    regex_patterns:           pats,
-    section_filter:           "",
-  };
-}
-
-async function cleanupPreview() {
-  const req = buildCleanupReq();
-  if (!req.repeated_word_enabled && !req.short_chunk_enabled && !req.regex_enabled)
-    return showToast('cl-toast', 'Enable at least one filter.', 'err');
-
-  spin('cl-preview-spinner', true);
-  document.getElementById('cl-preview-card').style.display = 'none';
-  document.getElementById('cl-apply-btn').style.display = 'none';
-  document.getElementById('cl-toast').className = 'toast';
-
-  try {
-    const res = await authFetch(API + '/cleanup/preview', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(req),
-    });
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || res.statusText);
-
-    const pct = d.total_chunks > 0 ? ((d.would_delete / d.total_chunks) * 100).toFixed(1) : 0;
-    document.getElementById('cl-summary').innerHTML =
-      `Would delete <strong>${d.would_delete.toLocaleString()}</strong> chunk(s) ` +
-      `out of <strong>${d.total_chunks.toLocaleString()}</strong> total (${pct}%). ` +
-      (d.would_delete > 20 ? `Showing first 20 samples below.` : '');
-
-    const samplesEl = document.getElementById('cl-samples');
-    samplesEl.innerHTML = '';
-    (d.samples || []).forEach(s => {
-      const el = document.createElement('div');
-      el.style.cssText = 'padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:5px;font-size:12px';
-      el.innerHTML =
-        '<div style="font-weight:600;margin-bottom:3px">' + esc(s.doc_title) + '</div>' +
-        '<div style="color:var(--muted);margin-bottom:6px">' + esc(s.section) + ' · chunk ' + s.chunk_index + ' · ' + esc(s.doc_type) + '</div>' +
-        '<div style="font-family:var(--mono);font-size:11px;white-space:pre-wrap;line-height:1.5;color:#444">' + esc(s.preview) + (s.preview.length >= 300 ? '…' : '') + '</div>';
-      samplesEl.appendChild(el);
-    });
-
-    document.getElementById('cl-preview-card').style.display = 'block';
-    if (d.would_delete > 0)
-      document.getElementById('cl-apply-btn').style.display = 'inline-flex';
-
-  } catch(e) {
-    showToast('cl-toast', '✕ ' + e.message, 'err');
-  }
-  spin('cl-preview-spinner', false);
-}
-
-async function cleanupApply() {
-  if (!confirm('This will permanently delete the matched chunks from the index and their cache entries. Continue?')) return;
-  const req = buildCleanupReq();
-  spin('cl-apply-spinner', true);
-  try {
-    const res = await authFetch(API + '/cleanup/apply', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(req),
-    });
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || res.statusText);
-    showToast('cl-toast',
-      `✓ Deleted ${d.deleted_chunks} chunk(s) from index, ${d.deleted_cache} cache file(s). Index now has ${d.total_chunks} chunks.`,
-      'ok');
-    document.getElementById('cl-apply-btn').style.display = 'none';
-    document.getElementById('cl-preview-card').style.display = 'none';
-  } catch(e) {
-    showToast('cl-toast', '✕ ' + e.message, 'err');
-  }
-  spin('cl-apply-spinner', false);
 }
 
 function esc(s) {

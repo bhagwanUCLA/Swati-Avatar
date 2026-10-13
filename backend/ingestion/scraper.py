@@ -719,33 +719,44 @@ class YouTubeChannelScraper:
             pass
         return None
 
-    def get_transcript(self, video_id: str) -> Optional[str]:
+    def get_transcript(self, video_id: str) -> tuple[Optional[str], str]:
         # FIX: use s.text (attribute) not s["text"] (dict) — youtube-transcript-api v1.x
+        failures: list[str] = []
         try:
             fetched = self.transcript_api.fetch(video_id, languages=["en"])
-            return " ".join([s.text for s in fetched]).strip()
-        except Exception:
-            pass
+            transcript = " ".join([s.text for s in fetched]).strip()
+            if transcript:
+                return transcript, ""
+            failures.append("direct English transcript was empty")
+        except Exception as exc:
+            failures.append(f"direct English transcript: {type(exc).__name__}: {exc}")
 
         try:
             t_list = self.transcript_api.list(video_id)
             # Try explicit English first
             try:
                 transcript = t_list.find_transcript(["en"])
-                return " ".join([s.text for s in transcript.fetch()]).strip()
-            except Exception:
-                pass
+                text = " ".join([s.text for s in transcript.fetch()]).strip()
+                if text:
+                    return text, ""
+                failures.append("listed English transcript was empty")
+            except Exception as exc:
+                failures.append(f"listed English transcript: {type(exc).__name__}: {exc}")
             # Fall back to any translatable transcript
             for t in t_list:
                 try:
                     if t.is_translatable:
-                        return " ".join([s.text for s in t.translate("en").fetch()]).strip()
-                except Exception:
+                        text = " ".join([s.text for s in t.translate("en").fetch()]).strip()
+                        if text:
+                            return text, ""
+                        failures.append("translated transcript was empty")
+                except Exception as exc:
+                    failures.append(f"translated transcript: {type(exc).__name__}: {exc}")
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            failures.append(f"transcript list: {type(exc).__name__}: {exc}")
 
-        return None
+        return None, "; ".join(failures)[:2000]
 
 
 # ---------------------------------------------------------------------------
@@ -844,13 +855,15 @@ class PortfolioScraper:
     def _summarise_video(self, url: str, section: str) -> list[ScrapedDocument]:
         if self.cache:
             c = self.cache.get_video(url)
-            if c:
+            if c and str(c.get("transcript") or "").strip():
                 return [self._make_doc(c["title"], section, url, c["transcript"], "video_summary")]
+            if c:
+                logger.warning("Ignoring empty cached YouTube content for %s", url)
 
         match = _YT_PATTERN.search(url)
         vid = match.group(1) if match else url.split("/")[-1].split("?")[0]
         title      = self._yt_scraper.get_video_title(vid) or f"Video {vid}"
-        transcript = self._yt_scraper.get_transcript(vid)
+        transcript, transcript_failure = self._yt_scraper.get_transcript(vid)
 
         if transcript:
             if self.cache:
@@ -859,7 +872,11 @@ class PortfolioScraper:
 
         # Fallback: ask Gemini to summarise the video directly via its URL
         if not self.gemini_client:
-            return []
+            raise RuntimeError(
+                "YouTube transcript retrieval failed "
+                f"({transcript_failure or 'no transcript was returned'}); "
+                "Gemini fallback cannot run because GEMINI_API_KEY is not configured."
+            )
         try:
             res = self.gemini_client.models.generate_content(
                 model=self.gemini_model,
@@ -875,13 +892,23 @@ class PortfolioScraper:
                     ),
                 ],
             )
-            t, s = _split_gemini_title(res.text, title)
+            response_text = getattr(res, "text", "") or ""
+            if not response_text.strip():
+                raise RuntimeError("Gemini fallback returned an empty response.")
+            t, s = _split_gemini_title(response_text, title)
+            s = _clean_text(s)
+            if not s:
+                raise RuntimeError("Gemini fallback returned no summary text after the title.")
             if self.cache:
                 self.cache.set_video(url, t, s)
             return [self._make_doc(t, section, url, s, "video_summary")]
-        except Exception as e:
-            logger.warning("Gemini video fallback failed for %s: %s", url, e)
-            return []
+        except Exception as exc:
+            logger.warning("Gemini video fallback failed for %s: %s", url, exc)
+            raise RuntimeError(
+                "YouTube transcript retrieval failed "
+                f"({transcript_failure or 'no transcript was returned'}); "
+                f"Gemini video fallback failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Internal helpers

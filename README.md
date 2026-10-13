@@ -64,8 +64,7 @@ Cloud Run uses the same module through `backend.server:app` in `Dockerfile`.
         │  Public routes:  /query/stream, /query,        │
         │                  /health, /stats               │
         │  Admin routes:   /ingest/*, /documents,        │
-        │                  /cleanup/*, /sessions/*,      │
-        │                  /config, /index               │
+        │                  /sessions/*, /config, /index  │
         │  Auth routes:    /admin/setup, /admin/setup/status │
         └───────────┬────────────────────┬──────────────┘
                     │                    │
@@ -278,8 +277,6 @@ When a user asks a question via `/query/stream` or `/query`:
 | POST | `/ingest/videos` | Ingest YouTube URLs / playlists |
 | GET | `/documents` | List indexed documents |
 | DELETE | `/documents/{doc_index}` | Delete all chunks for one document |
-| POST | `/cleanup/preview` | Dry-run quality filter (repeated words, short chunks, regex) |
-| POST | `/cleanup/apply` | Apply quality filter and delete matched chunks |
 | GET | `/sessions` | List session IDs |
 | GET | `/sessions/history` | All sessions with full message history |
 | DELETE | `/sessions/{id}` | Clear one session |

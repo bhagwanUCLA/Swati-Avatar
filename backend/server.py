@@ -3006,44 +3006,6 @@ def ingest_videos(body: VideosIngestRequest, _: AdminDep):
 
 
 # ---------------------------------------------------------------------------
-# Cleanup  (admin)
-# ---------------------------------------------------------------------------
-
-@app.post("/cleanup/preview")
-def cleanup_preview(body: CleanupRequest, _: AdminDep):
-    """
-    Dry-run: return how many chunks would be deleted and up to 20 samples.
-    No changes are made to the index.
-    """
-    db = _get_rag().db
-    flagged, samples = _scan_cleanup_candidates(db, body)
-    return {
-        "would_delete": len(flagged),
-        "total_chunks": len(db._meta),
-        "samples":      samples,
-    }
-
-
-@app.post("/cleanup/apply")
-@_serialized_index_mutation
-def cleanup_apply(body: CleanupRequest, _: AdminDep):
-    """
-    Apply the same filters as /cleanup/preview and permanently delete matched chunks.
-    Saves the updated index to disk (and GCS if configured).
-    """
-    rag = _get_rag()
-    flagged, _ = _scan_cleanup_candidates(rag.db, body)
-    if flagged:
-        rag.db._remove_int_ids(flagged)
-        _save_and_sync(rag)
-    return {
-        "deleted_chunks": len(flagged),
-        "deleted_cache":  0,
-        "total_chunks":   len(rag.db._meta),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Danger zone  (admin)
 # ---------------------------------------------------------------------------
 

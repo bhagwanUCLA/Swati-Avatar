@@ -198,12 +198,6 @@ instance and synchronized to the configured GCS prompt object in production.
 `GET /sessions/history` returns paginated persisted chat sessions. The tab renders each
 session as an expandable conversation. `DELETE /sessions` clears all sessions.
 
-### Cleanup
-
-`POST /cleanup/preview` performs a dry run for repeated-word, short-chunk, and regex
-filters. `POST /cleanup/apply` permanently removes the confirmed matching chunks and
-saves the primary index pair.
-
 ## Operational Notes
 
 - The current deployment configuration runs one Gunicorn worker, one Cloud Run instance,
