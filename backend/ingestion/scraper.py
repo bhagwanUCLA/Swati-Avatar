@@ -721,42 +721,15 @@ class YouTubeChannelScraper:
 
     def get_transcript(self, video_id: str) -> tuple[Optional[str], str]:
         # FIX: use s.text (attribute) not s["text"] (dict) — youtube-transcript-api v1.x
-        failures: list[str] = []
         try:
             fetched = self.transcript_api.fetch(video_id, languages=["en"])
             transcript = " ".join([s.text for s in fetched]).strip()
             if transcript:
                 return transcript, ""
-            failures.append("direct English transcript was empty")
+            return None, "direct English transcript was empty"
         except Exception as exc:
-            failures.append(f"direct English transcript: {type(exc).__name__}: {exc}")
-
-        try:
-            t_list = self.transcript_api.list(video_id)
-            # Try explicit English first
-            try:
-                transcript = t_list.find_transcript(["en"])
-                text = " ".join([s.text for s in transcript.fetch()]).strip()
-                if text:
-                    return text, ""
-                failures.append("listed English transcript was empty")
-            except Exception as exc:
-                failures.append(f"listed English transcript: {type(exc).__name__}: {exc}")
-            # Fall back to any translatable transcript
-            for t in t_list:
-                try:
-                    if t.is_translatable:
-                        text = " ".join([s.text for s in t.translate("en").fetch()]).strip()
-                        if text:
-                            return text, ""
-                        failures.append("translated transcript was empty")
-                except Exception as exc:
-                    failures.append(f"translated transcript: {type(exc).__name__}: {exc}")
-                    continue
-        except Exception as exc:
-            failures.append(f"transcript list: {type(exc).__name__}: {exc}")
-
-        return None, "; ".join(failures)[:2000]
+            detail = " ".join(str(exc).split())
+            return None, f"direct English transcript: {type(exc).__name__}: {detail[:240]}"
 
 
 # ---------------------------------------------------------------------------
