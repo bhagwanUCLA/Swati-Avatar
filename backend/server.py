@@ -130,9 +130,11 @@ def _load_deployed_gemini_api_key() -> str:
 
 app = FastAPI(title="Portfolio RAG API", version="3.0")
 
+_PUBLIC_USER_FRONTEND_URL = "https://swati-avatar-frontend.vercel.app"
+_PUBLIC_ADMIN_FRONTEND_URL = "https://swati-desai-avatar-admin.vercel.app"
 _CORS_ALLOWED_ORIGINS = [
-    "https://swati-desai-avatar.vercel.app",
-    "https://swati-avatar-admin.vercel.app",
+    _PUBLIC_USER_FRONTEND_URL,
+    _PUBLIC_ADMIN_FRONTEND_URL,
 ]
 
 app.add_middleware(
@@ -2405,10 +2407,7 @@ async def forgot_password(request: Request):
     if not project:
         raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Not available in local dev mode.")
 
-    frontend_url = os.environ.get("ADMIN_FRONTEND_URL", "").rstrip("/")
-    if not frontend_url:
-        logger.warning("forgot_password: ADMIN_FRONTEND_URL not set")
-        return {"message": "If reset is configured, an email has been sent."}
+    frontend_url = _PUBLIC_ADMIN_FRONTEND_URL
 
     client_ip = request.client.host if request.client else "unknown"
     now = datetime.now(timezone.utc).timestamp()
