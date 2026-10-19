@@ -135,6 +135,7 @@ _PUBLIC_ADMIN_FRONTEND_URL = "https://swati-desai-avatar-admin.vercel.app"
 _CORS_ALLOWED_ORIGINS = [
     _PUBLIC_USER_FRONTEND_URL,
     _PUBLIC_ADMIN_FRONTEND_URL,
+    "https://avatar.swatidesai.com",
 ]
 
 app.add_middleware(

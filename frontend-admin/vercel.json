@@ -4,8 +4,7 @@
     {
       "source": "/:path*",
       "destination": "https://swati-desai-avatar-admin.vercel.app/:path*",
-      "permanent": true,
-      "preserveQueryParams": true
+      "permanent": true
     }
   ]
 }

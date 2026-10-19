@@ -4,8 +4,7 @@
     {
       "source": "/:path*",
       "destination": "https://swati-avatar-frontend.vercel.app/:path*",
-      "permanent": true,
-      "preserveQueryParams": true
+      "permanent": true
     }
   ]
 }
