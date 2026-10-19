@@ -6,6 +6,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <title>Swati Desai</title>
+  <script>
+    (() => {
+      const destination = 'https://swati-avatar-frontend.vercel.app';
+      if (window.location.origin !== destination) {
+        window.location.replace(destination + window.location.pathname + window.location.search + window.location.hash);
+      }
+    })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
